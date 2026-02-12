@@ -33,18 +33,27 @@
     state: present
     update_cache: yes
 
-# 4. Installation des outils K8s (kubelet, kubeadm, kubectl)
-- name: Ajouter la clé GPG de Google Cloud
-  apt_key:
-    url: https://packages.cloud.google.com/apt/doc/apt-key.gpg
-    state: present
+# 4. Installation des outils K8s (Nouvelle méthode officielle)
+- name: Créer le dossier pour la clé de dépôt
+  file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: '0755'
 
-- name: Ajouter le dépôt Kubernetes
+- name: Télécharger la clé GPG du dépôt K8s
+  get_url:
+    url: https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key
+    dest: /etc/apt/keyrings/kubernetes-apt-keyring.asc
+    mode: '0644'
+
+- name: Ajouter le dépôt Kubernetes (v1.29)
   apt_repository:
-    repo: deb https://apt.kubernetes.io/ kubernetes-jammy main
+    repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.asc] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /"
     state: present
+    filename: kubernetes
 
 - name: Installer les composants Kubernetes
   apt:
     name: [kubelet, kubeadm, kubectl]
     state: present
+    update_cache: yes
