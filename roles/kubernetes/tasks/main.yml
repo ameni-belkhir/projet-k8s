@@ -41,7 +41,7 @@
 
 - name: Ajouter le dépôt Kubernetes
   apt_repository:
-    repo: deb https://apt.kubernetes.io/ kubernetes-xenial main
+    repo: deb https://apt.kubernetes.io/ kubernetes-jammy main
     state: present
 
 - name: Installer les composants Kubernetes
