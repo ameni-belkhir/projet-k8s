@@ -1,0 +1,14 @@
+---
+- name: Installer Helm (gestionnaire de paquets K8s)
+  shell: |
+    curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+- name: Ajouter le repo Prometheus
+  shell: |
+    helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+    helm repo update
+
+- name: Installer Prometheus Stack (Prometheus + Grafana)
+  shell: |
+    export KUBECONFIG=/etc/kubernetes/admin.conf
+    helm install prometheus prometheus-community/kube-prometheus-stack

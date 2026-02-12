@@ -1,0 +1,50 @@
+---
+# 1. Désactivation du Swap (obligatoire pour K8s)
+- name: Désactiver le swap immédiatement
+  command: swapoff -a
+
+- name: Supprimer le swap du fichier fstab
+  replace:
+    path: /etc/fstab
+    regexp: '^([^#].*?\sswap\s+.*)$'
+    replace: '# \1'
+
+# 2. Configuration du réseau (Modules Kernel)
+- name: Charger les modules bridge et overlay
+  modprobe:
+    name: "{{ item }}"
+    state: present
+  loop: [ 'overlay', 'br_netfilter' ]
+
+- name: Configurer les paramètres sysctl pour le réseau
+  sysctl:
+    name: "{{ item.key }}"
+    value: "{{ item.value }}"
+    state: present
+  loop:
+    - { key: 'net.bridge.bridge-nf-call-iptables', value: '1' }
+    - { key: 'net.bridge.bridge-nf-call-ip6tables', value: '1' }
+    - { key: 'net.ipv4.ip_forward', value: '1' }
+
+# 3. Installation du runtime (Docker/Containerd)
+- name: Installer Docker
+  apt:
+    name: docker.io
+    state: present
+    update_cache: yes
+
+# 4. Installation des outils K8s (kubelet, kubeadm, kubectl)
+- name: Ajouter la clé GPG de Google Cloud
+  apt_key:
+    url: https://packages.cloud.google.com/apt/doc/apt-key.gpg
+    state: present
+
+- name: Ajouter le dépôt Kubernetes
+  apt_repository:
+    repo: deb https://apt.kubernetes.io/ kubernetes-xenial main
+    state: present
+
+- name: Installer les composants Kubernetes
+  apt:
+    name: [kubelet, kubeadm, kubectl]
+    state: present
