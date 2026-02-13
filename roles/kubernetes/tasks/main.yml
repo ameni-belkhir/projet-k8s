@@ -1,6 +1,6 @@
 ---
-# 1. Nettoyage des anciennes configurations obsolètes
-- name: Supprimer l'ancien dépôt Kubernetes et sa clé
+# 1. NETTOYAGE DES ANCIENNES CONFIGURATIONS
+- name: Supprimer l'ancien dépôt Kubernetes et sa clé (évite les erreurs 404/GPG)
   file:
     path: "{{ item }}"
     state: absent
@@ -8,25 +8,24 @@
     - /etc/apt/sources.list.d/kubernetes.list
     - /etc/apt/keyrings/kubernetes-apt-keyring.asc
 
-# 2. Préparation du système (Swap)
+# 2. PRÉPARATION DU SYSTÈME (SWAP & MODULES)
 - name: Désactiver le swap immédiatement
   command: swapoff -a
   when: ansible_swaptotal_mb > 0
 
-- name: Supprimer le swap du fichier fstab
+- name: Supprimer le swap du fichier fstab pour le reboot
   replace:
     path: /etc/fstab
     regexp: '^([^#].*?\sswap\s+.*)$'
     replace: '# \1'
 
-# 3. Configuration réseau (Persistante)
 - name: Charger les modules bridge et overlay
   modprobe:
     name: "{{ item }}"
     state: present
   loop: [ 'overlay', 'br_netfilter' ]
 
-- name: Configurer les paramètres sysctl pour le réseau
+- name: Configurer les paramètres sysctl pour le réseau (IPv4 forward & bridge)
   sysctl:
     name: "{{ item.key }}"
     value: "{{ item.value }}"
@@ -38,21 +37,20 @@
     - { key: 'net.bridge.bridge-nf-call-ip6tables', value: '1' }
     - { key: 'net.ipv4.ip_forward', value: '1' }
 
-# 4. Installation du runtime (Docker)
+# 3. INSTALLATION DU RUNTIME ET DES OUTILS
 - name: Installer Docker
   apt:
     name: docker.io
     state: present
     update_cache: yes
 
-# 5. Installation des outils K8s (v1.29)
-- name: Créer le dossier pour la clé de dépôt
+- name: Créer le dossier pour la clé de dépôt K8s
   file:
     path: /etc/apt/keyrings
     state: directory
     mode: '0755'
 
-- name: Télécharger la clé GPG officielle
+- name: Télécharger la clé GPG officielle Kubernetes
   get_url:
     url: https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key
     dest: /etc/apt/keyrings/kubernetes-apt-keyring.asc
@@ -64,13 +62,13 @@
     state: present
     filename: kubernetes
 
-- name: Installer les composants Kubernetes
+- name: Installer kubelet, kubeadm et kubectl
   apt:
     name: [kubelet, kubeadm, kubectl]
     state: present
     update_cache: yes
 
-# 6. Initialisation du Cluster (Uniquement sur le Master)
+# 4. INITIALISATION DU CLUSTER (UNIQUEMENT SUR LE MASTER)
 - name: Initialiser le Master Kubernetes
   command: kubeadm init --pod-network-cidr=10.244.0.0/16
   register: kubeadm_init
