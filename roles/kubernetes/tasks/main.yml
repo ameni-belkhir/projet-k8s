@@ -1,5 +1,5 @@
 ---
-# 1. Préparation Système
+# 1. Nettoyage et Préparation Système
 - name: Supprimer anciens dépôts
   file:
     path: "{{ item }}"
@@ -31,14 +31,33 @@
     - { key: 'net.bridge.bridge-nf-call-iptables', value: '1' }
     - { key: 'net.ipv4.ip_forward', value: '1' }
 
-# 2. Installation Composants
+# 2. Configuration du Dépôt Kubernetes v1.29 (CRUCIAL pour trouver kubelet)
+- name: Créer le dossier pour la clé de dépôt
+  file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: '0755'
+
+- name: Télécharger la clé GPG officielle Kubernetes
+  get_url:
+    url: https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key
+    dest: /etc/apt/keyrings/kubernetes-apt-keyring.asc
+    mode: '0644'
+
+- name: Ajouter le dépôt Kubernetes v1.29
+  apt_repository:
+    repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.asc] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /"
+    state: present
+    filename: kubernetes
+
+# 3. Installation des Composants
 - name: Installer Docker et Outils K8s
   apt:
     name: [docker.io, kubelet, kubeadm, kubectl]
     state: present
     update_cache: yes
 
-# 3. Logique MASTER
+# 4. Logique MASTER
 - name: Initialiser le Master Kubernetes (CIDR Calico)
   command: kubeadm init --pod-network-cidr=192.168.0.0/16 --token=abcdef.1234567890abcdef12 --ignore-preflight-errors=all
   register: kubeadm_init
@@ -58,7 +77,7 @@
     mode: '0755'
   when: "'master' in ansible_hostname"
 
-- name: Configurer kubectl
+- name: Configurer kubectl (Copie du config)
   copy:
     src: /etc/kubernetes/admin.conf
     dest: /home/ubuntu/.kube/config
@@ -68,7 +87,7 @@
     mode: '0600'
   when: "'master' in ansible_hostname"
 
-- name: Attendre que l'API Server (6443) soit prêt
+- name: Attendre que l'API Server soit prêt
   wait_for:
     port: 6443
     delay: 15
@@ -95,11 +114,11 @@
   until: calico_res is succeeded
   when: "'master' in ansible_hostname"
 
-# 4. Logique WORKER
+# 5. Logique WORKER
 - name: Rejoindre le cluster automatiquement
   command: kubeadm join 172.16.1.128:6443 --token=abcdef.1234567890abcdef12 --discovery-token-unsafe-skip-ca-verification
   register: worker_join
-  retries: 5
+  retries: 10
   delay: 30
   until: worker_join is succeeded
   args:
