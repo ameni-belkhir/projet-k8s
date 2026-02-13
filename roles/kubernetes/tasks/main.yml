@@ -59,7 +59,7 @@
 
 # 4. Logique MASTER
 - name: Initialiser le Master Kubernetes (CIDR Calico)
-  command: kubeadm init --pod-network-cidr=192.168.0.0/16 --token=abcdef.1234567890abcdef12 --ignore-preflight-errors=all
+  command: kubeadm init --pod-network-cidr=192.168.0.0/16 --token=abcdef.1234567890abcdef --ignore-preflight-errors=all
   register: kubeadm_init
   retries: 3
   delay: 30
@@ -116,7 +116,7 @@
 
 # 5. Logique WORKER
 - name: Rejoindre le cluster automatiquement
-  command: kubeadm join 172.16.1.128:6443 --token=abcdef.1234567890abcdef12 --discovery-token-unsafe-skip-ca-verification
+  command: kubeadm join 172.16.1.128:6443 --token=abcdef.1234567890abcdef --discovery-token-unsafe-skip-ca-verification
   register: worker_join
   retries: 10
   delay: 30
