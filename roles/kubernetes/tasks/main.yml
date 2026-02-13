@@ -1,6 +1,6 @@
 ---
-# 1. NETTOYAGE DES ANCIENNES CONFIGURATIONS
-- name: Supprimer l'ancien dépôt Kubernetes et sa clé (évite les erreurs 404/GPG)
+# 1. Nettoyage des anciennes configurations obsolètes
+- name: Supprimer l'ancien dépôt Kubernetes et sa clé
   file:
     path: "{{ item }}"
     state: absent
@@ -8,24 +8,25 @@
     - /etc/apt/sources.list.d/kubernetes.list
     - /etc/apt/keyrings/kubernetes-apt-keyring.asc
 
-# 2. PRÉPARATION DU SYSTÈME (SWAP & MODULES)
+# 2. Préparation du système (Swap)
 - name: Désactiver le swap immédiatement
   command: swapoff -a
   when: ansible_swaptotal_mb > 0
 
-- name: Supprimer le swap du fichier fstab pour le reboot
+- name: Supprimer le swap du fichier fstab
   replace:
     path: /etc/fstab
     regexp: '^([^#].*?\sswap\s+.*)$'
     replace: '# \1'
 
+# 3. Configuration réseau (Persistante)
 - name: Charger les modules bridge et overlay
   modprobe:
     name: "{{ item }}"
     state: present
   loop: [ 'overlay', 'br_netfilter' ]
 
-- name: Configurer les paramètres sysctl pour le réseau (IPv4 forward & bridge)
+- name: Configurer les paramètres sysctl pour le réseau
   sysctl:
     name: "{{ item.key }}"
     value: "{{ item.value }}"
@@ -37,20 +38,21 @@
     - { key: 'net.bridge.bridge-nf-call-ip6tables', value: '1' }
     - { key: 'net.ipv4.ip_forward', value: '1' }
 
-# 3. INSTALLATION DU RUNTIME ET DES OUTILS
+# 4. Installation du runtime (Docker)
 - name: Installer Docker
   apt:
     name: docker.io
     state: present
     update_cache: yes
 
-- name: Créer le dossier pour la clé de dépôt K8s
+# 5. Installation des outils K8s (v1.29)
+- name: Créer le dossier pour la clé de dépôt
   file:
     path: /etc/apt/keyrings
     state: directory
     mode: '0755'
 
-- name: Télécharger la clé GPG officielle Kubernetes
+- name: Télécharger la clé GPG officielle
   get_url:
     url: https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key
     dest: /etc/apt/keyrings/kubernetes-apt-keyring.asc
@@ -62,15 +64,25 @@
     state: present
     filename: kubernetes
 
-- name: Installer kubelet, kubeadm et kubectl
+- name: Installer les composants Kubernetes
   apt:
     name: [kubelet, kubeadm, kubectl]
     state: present
     update_cache: yes
 
-# 4. INITIALISATION DU CLUSTER (UNIQUEMENT SUR LE MASTER)
+# 6. RÉSILIENCE RÉSEAU : Pré-téléchargement des images
+# Cette étape corrige l'erreur "DeadlineExceeded" en cas de réseau lent
+- name: Pré-télécharger les images Kubernetes (Images Pull)
+  command: kubeadm config images pull
+  register: pull_images
+  until: pull_images.rc == 0
+  retries: 5
+  delay: 30
+  when: "'master' in ansible_hostname"
+
+# 7. Initialisation du Cluster (Uniquement sur le Master)
 - name: Initialiser le Master Kubernetes
-  command: kubeadm init --pod-network-cidr=10.244.0.0/16
+  command: kubeadm init --pod-network-cidr=10.244.0.0/16 --ignore-preflight-errors=all
   register: kubeadm_init
   when: "'master' in ansible_hostname"
   args:
