@@ -1,0 +1,6 @@
+---
+- hosts: localhost
+  connection: local
+  become: yes
+  roles:
+    - kubernetes  # Installe juste Docker et les outils K8s
