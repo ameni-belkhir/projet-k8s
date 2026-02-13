@@ -12,12 +12,21 @@
   command: swapoff -a
   when: ansible_swaptotal_mb > 0
 
+- name: Charger les modules noyau nécessaires
+  modprobe:
+    name: "{{ item }}"
+    state: present
+  loop:
+    - overlay
+    - br_netfilter
+
 - name: Configuration sysctl réseau
   sysctl:
     name: "{{ item.key }}"
     value: "{{ item.value }}"
     state: present
     reload: yes
+    sysctl_file: /etc/sysctl.d/k8s.conf
   loop:
     - { key: 'net.bridge.bridge-nf-call-iptables', value: '1' }
     - { key: 'net.ipv4.ip_forward', value: '1' }
