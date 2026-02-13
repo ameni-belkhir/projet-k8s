@@ -1,6 +1,6 @@
 ---
-# 1. Nettoyage des anciennes configurations obsolètes
-- name: Supprimer l'ancien dépôt Kubernetes et sa clé
+# 1. Préparation Système
+- name: Supprimer anciens dépôts
   file:
     path: "{{ item }}"
     state: absent
@@ -8,71 +8,29 @@
     - /etc/apt/sources.list.d/kubernetes.list
     - /etc/apt/keyrings/kubernetes-apt-keyring.asc
 
-# 2. Préparation du système (Swap)
-- name: Désactiver le swap immédiatement
+- name: Désactiver le swap
   command: swapoff -a
   when: ansible_swaptotal_mb > 0
 
-- name: Supprimer le swap du fichier fstab
-  replace:
-    path: /etc/fstab
-    regexp: '^([^#].*?\sswap\s+.*)$'
-    replace: '# \1'
-
-# 3. Configuration réseau (Persistante)
-- name: Charger les modules bridge et overlay
-  modprobe:
-    name: "{{ item }}"
-    state: present
-  loop: [ 'overlay', 'br_netfilter' ]
-
-- name: Configurer les paramètres sysctl pour le réseau
+- name: Configuration sysctl réseau
   sysctl:
     name: "{{ item.key }}"
     value: "{{ item.value }}"
     state: present
-    sysctl_file: /etc/sysctl.d/k8s.conf
     reload: yes
   loop:
     - { key: 'net.bridge.bridge-nf-call-iptables', value: '1' }
-    - { key: 'net.bridge.bridge-nf-call-ip6tables', value: '1' }
     - { key: 'net.ipv4.ip_forward', value: '1' }
 
-# 4. Installation du runtime (Docker)
-- name: Installer Docker
+# 2. Installation Composants
+- name: Installer Docker et Outils K8s
   apt:
-    name: docker.io
+    name: [docker.io, kubelet, kubeadm, kubectl]
     state: present
     update_cache: yes
 
-# 5. Installation des outils K8s (v1.29)
-- name: Créer le dossier pour la clé de dépôt
-  file:
-    path: /etc/apt/keyrings
-    state: directory
-    mode: '0755'
-
-- name: Télécharger la clé GPG officielle
-  get_url:
-    url: https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key
-    dest: /etc/apt/keyrings/kubernetes-apt-keyring.asc
-    mode: '0644'
-
-- name: Ajouter le dépôt Kubernetes v1.29
-  apt_repository:
-    repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.asc] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /"
-    state: present
-    filename: kubernetes
-
-- name: Installer les composants Kubernetes
-  apt:
-    name: [kubelet, kubeadm, kubectl]
-    state: present
-    update_cache: yes
-
-# 6. Initialisation du Cluster (Uniquement sur le Master)
-# Note : Changement du CIDR pour compatibilité Calico par défaut
-- name: Initialiser le Master Kubernetes
+# 3. Logique MASTER
+- name: Initialiser le Master Kubernetes (CIDR Calico)
   command: kubeadm init --pod-network-cidr=192.168.0.0/16 --token=abcdef.1234567890abcdef12 --ignore-preflight-errors=all
   register: kubeadm_init
   retries: 3
@@ -82,33 +40,59 @@
   args:
     creates: /etc/kubernetes/admin.conf
 
-- name: Configurer kubectl pour l'utilisateur ubuntu
-  shell: |
-    mkdir -p /home/ubuntu/.kube
-    cp -f /etc/kubernetes/admin.conf /home/ubuntu/.kube/config
-    chown ubuntu:ubuntu /home/ubuntu/.kube/config
+- name: Créer le répertoire .kube
+  file:
+    path: /home/ubuntu/.kube
+    state: directory
+    owner: ubuntu
+    group: ubuntu
+    mode: '0755'
   when: "'master' in ansible_hostname"
 
-# 7. Installation de Calico (Remplace Flannel)
+- name: Configurer kubectl
+  copy:
+    src: /etc/kubernetes/admin.conf
+    dest: /home/ubuntu/.kube/config
+    remote_src: yes
+    owner: ubuntu
+    group: ubuntu
+    mode: '0600'
+  when: "'master' in ansible_hostname"
+
+- name: Attendre que l'API Server (6443) soit prêt
+  wait_for:
+    port: 6443
+    delay: 15
+    timeout: 300
+  when: "'master' in ansible_hostname"
+
 - name: Installer l'Operator Tigera (Calico)
   become: yes
   become_user: ubuntu
-  command: kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/tigera-operator.yaml
-  when: "'master' in ansible_hostname"
-
-- name: Installer les ressources personnalisées Calico
-  become: yes
-  become_user: ubuntu
-  command: kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/custom-resources.yaml
-  when: "'master' in ansible_hostname"
+  command: kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/tigera-operator.yaml --validate=false
+  register: tigera_res
   retries: 5
   delay: 20
-  register: calico_res
-  until: calico_res is succeeded
+  until: tigera_res is succeeded
+  when: "'master' in ansible_hostname"
 
-# 8. Join des Workers (Full Automation)
+- name: Installer les ressources Calico
+  become: yes
+  become_user: ubuntu
+  command: kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/custom-resources.yaml --validate=false
+  register: calico_res
+  retries: 5
+  delay: 20
+  until: calico_res is succeeded
+  when: "'master' in ansible_hostname"
+
+# 4. Logique WORKER
 - name: Rejoindre le cluster automatiquement
   command: kubeadm join 172.16.1.128:6443 --token=abcdef.1234567890abcdef12 --discovery-token-unsafe-skip-ca-verification
+  register: worker_join
+  retries: 5
+  delay: 30
+  until: worker_join is succeeded
   args:
     creates: /etc/kubernetes/kubelet.conf
   when: "'worker' in ansible_hostname"
