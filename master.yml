@@ -1,6 +1,7 @@
 ---
 - name: Full Master Deployment (K8s + Monitoring)
-  hosts: all
+  hosts: localhost  
+  connection: local 
   become: yes
   roles:
     - kubernetes
