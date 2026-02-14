@@ -1,17 +1,16 @@
 ---
-# 1. Protection contre les verrous APT (Crucial pour les nouvelles stacks)
+# 1. Protection contre les verrous APT & Réparations
 - name: Attendre que le verrou APT soit libéré
   shell: while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do sleep 5; done;
   changed_when: false
 
 - name: Réparer les installations de paquets interrompues
-  command: "{{ item }}"
-  with_items:
-    - dpkg --configure -a
-    - apt-get install -f
+  shell: |
+    dpkg --configure -a
+    apt-get install -f -y
   ignore_errors: yes
 
-# 2. System Preparation (Common to all nodes)
+# 2. System Preparation (Common)
 - name: Remove old Kubernetes repositories
   file:
     path: "{{ item }}"
@@ -42,52 +41,43 @@
     - { key: 'net.bridge.bridge-nf-call-iptables', value: '1' }
     - { key: 'net.ipv4.ip_forward', value: '1' }
 
-# 3. Dependencies (Common to all nodes)
+# 3. Dependencies & CRI-Dockerd
 - name: Create keyrings directory
   file:
     path: /etc/apt/keyrings
     state: directory
     mode: '0755'
 
-- name: Download Kubernetes GPG key
-  get_url:
-    url: https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key
-    dest: /etc/apt/keyrings/kubernetes-apt-keyring.asc
-    mode: '0644'
-
-- name: Add Kubernetes v1.29 repository
-  apt_repository:
-    repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.asc] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /"
-    state: present
-    filename: kubernetes
+- name: Setup Kubernetes Repository
+  block:
+    - name: Download GPG key
+      get_url:
+        url: https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key
+        dest: /etc/apt/keyrings/kubernetes-apt-keyring.asc
+        mode: '0644'
+    - name: Add Repository
+      apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.asc] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /"
+        state: present
+        filename: kubernetes
 
 - name: Install Docker and K8s tools
   apt:
     name: [docker.io, kubelet, kubeadm, kubectl]
     state: present
     update_cache: yes
-    force_apt_get: yes
 
-# --- CRI-DOCKERD & CGROUP FIX (Common) ---
-- name: Configure Docker Cgroup Driver to Systemd
+- name: Configure Docker (Cgroup systemd)
   copy:
     dest: /etc/docker/daemon.json
     content: |
       {
         "exec-opts": ["native.cgroupdriver=systemd"],
         "log-driver": "json-file",
-        "log-opts": { "max-size": "100m" },
         "storage-driver": "overlay2"
       }
 
-- name: Restart and Enable Docker
-  systemd:
-    name: docker
-    state: restarted
-    enabled: yes
-    daemon_reload: yes
-
-- name: Install and Enable cri-dockerd
+- name: Install and Start cri-dockerd
   block:
     - name: Download cri-dockerd
       get_url:
@@ -97,13 +87,15 @@
       apt:
         deb: /tmp/cri-dockerd.deb
         state: present
-    - name: Start cri-docker
+    - name: Ensure services are running
       systemd:
-        name: cri-docker
-        state: started
+        name: "{{ item }}"
+        state: restarted
         enabled: yes
+        daemon_reload: yes
+      loop: [docker, cri-docker]
 
-# 4. Master Node Logic
+# 4. Master Node Initialization
 - name: Initialize Kubernetes Master
   command: >
     kubeadm init --pod-network-cidr=192.168.0.0/16 
@@ -114,49 +106,40 @@
     creates: /etc/kubernetes/admin.conf
   when: "'master' in ansible_hostname"
 
-- name: Configure kubeconfig for Ubuntu user
-  file:
-    path: /home/ubuntu/.kube
-    state: directory
-    owner: ubuntu
-    group: ubuntu
+- name: Setup Kubeconfig for Ubuntu
+  block:
+    - file: path=/home/ubuntu/.kube state=directory owner=ubuntu group=ubuntu
+    - copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /home/ubuntu/.kube/config
+        remote_src: yes
+        owner: ubuntu
+        group: ubuntu
+        mode: '0600'
   when: "'master' in ansible_hostname"
 
-- name: Copy admin.conf to user
-  copy:
-    src: /etc/kubernetes/admin.conf
-    dest: /home/ubuntu/.kube/config
-    remote_src: yes
-    owner: ubuntu
-    group: ubuntu
-    mode: '0600'
-  when: "'master' in ansible_hostname"
-
-# 5. Network & Monitoring (Master Only)
-- name: Install Calico (Operator + CR)
-  become: yes
-  become_user: ubuntu
-  shell: |
-    kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/tigera-operator.yaml
-    sleep 10
-    kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/custom-resources.yaml
-  when: "'master' in ansible_hostname"
-  ignore_errors: yes
-
-- name: Monitoring Setup (Prometheus)
+# 5. Network & Monitoring (MASTER ONLY)
+- name: Install Calico & Prometheus
   when: "'master' in ansible_hostname"
   block:
-    - name: Ajouter le repo Prometheus
+    - name: Calico Network
+      become: yes
+      become_user: ubuntu
       shell: |
-        curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+        kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/tigera-operator.yaml
+        sleep 5
+        kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/custom-resources.yaml
+      ignore_errors: yes
+
+    - name: Helm & Prometheus
+      shell: |
+        if ! command -v helm &> /dev/null; then curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash; fi
         helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
         helm repo update
-    - name: Installer Prometheus Stack
-      shell: |
         export KUBECONFIG=/etc/kubernetes/admin.conf
         helm install prometheus prometheus-community/kube-prometheus-stack --namespace monitoring --create-namespace
-      register: helm_install
-      failed_when: "helm_install.rc != 0 and 'already exists' not in helm_install.stderr"
+      register: helm_out
+      failed_when: "helm_out.rc != 0 and 'already exists' not in helm_out.stderr"
 
 # 6. Worker Node Logic
 - name: Join Worker nodes to Cluster
