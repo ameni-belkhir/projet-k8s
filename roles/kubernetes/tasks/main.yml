@@ -31,7 +31,7 @@
     - { key: 'net.bridge.bridge-nf-call-iptables', value: '1' }
     - { key: 'net.ipv4.ip_forward', value: '1' }
 
-# 2. Configuration du Dépôt Kubernetes v1.29
+# 2. Configuration du Dépôt et Installation
 - name: Créer le dossier pour la clé de dépôt
   file:
     path: /etc/apt/keyrings
@@ -50,15 +50,42 @@
     state: present
     filename: kubernetes
 
-# 3. Installation des Composants
 - name: Installer Docker et Outils K8s
   apt:
     name: [docker.io, kubelet, kubeadm, kubectl]
     state: present
     update_cache: yes
 
+# --- CORRECTION CRUCIALE : CGROUP DRIVER ---
+- name: Configurer Docker pour utiliser systemd (évite le CrashLoopBackOff)
+  copy:
+    dest: /etc/docker/daemon.json
+    content: |
+      {
+        "exec-opts": ["native.cgroupdriver=systemd"],
+        "log-driver": "json-file",
+        "log-opts": { "max-size": "100m" },
+        "storage-driver": "overlay2"
+      }
+  register: docker_config
+
+- name: Redémarrer Docker si configuration modifiée
+  systemd:
+    name: docker
+    state: restarted
+    enabled: yes
+    daemon_reload: yes
+  when: docker_config.changed
+
+- name: Redémarrer Kubelet
+  systemd:
+    name: kubelet
+    state: restarted
+    enabled: yes
+# ------------------------------------------
+
 # 4. Logique MASTER
-- name: Initialiser le Master Kubernetes (CIDR Calico)
+- name: Initialiser le Master Kubernetes
   command: kubeadm init --pod-network-cidr=192.168.0.0/16 --token=abcdef.1234567890abcdef --ignore-preflight-errors=all
   register: kubeadm_init
   retries: 3
@@ -92,32 +119,31 @@
     seconds: 30
   when: "'master' in ansible_hostname"
 
-- name: Attendre que l'API Server soit prêt (Port 6443)
-  wait_for:
-    port: 6443
-    delay: 5
-    timeout: 300
+- name: Attendre que l'API Server soit prêt via kubectl
+  command: kubectl --kubeconfig /etc/kubernetes/admin.conf get nodes
+  register: api_ready
+  retries: 20
+  delay: 10
+  until: api_ready is succeeded
   when: "'master' in ansible_hostname"
 
 - name: Installer l'Operator Tigera (Calico)
-  become: yes
-  become_user: ubuntu
-  command: kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/tigera-operator.yaml --validate=false
+  command: kubectl --kubeconfig /etc/kubernetes/admin.conf create -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/tigera-operator.yaml --validate=false
   register: tigera_res
-  retries: 15
+  retries: 10
   delay: 15
   until: tigera_res is succeeded
   when: "'master' in ansible_hostname"
+  ignore_errors: yes
 
 - name: Installer les ressources Calico
-  become: yes
-  become_user: ubuntu
-  command: kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/custom-resources.yaml --validate=false
+  command: kubectl --kubeconfig /etc/kubernetes/admin.conf create -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/custom-resources.yaml --validate=false
   register: calico_res
   retries: 10
   delay: 15
   until: calico_res is succeeded
   when: "'master' in ansible_hostname"
+  ignore_errors: yes
 
 # 5. Logique WORKER
 - name: Rejoindre le cluster automatiquement
