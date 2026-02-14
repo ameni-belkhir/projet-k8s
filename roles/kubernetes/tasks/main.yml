@@ -31,7 +31,7 @@
     - { key: 'net.bridge.bridge-nf-call-iptables', value: '1' }
     - { key: 'net.ipv4.ip_forward', value: '1' }
 
-# 2. Configuration du Dépôt Kubernetes v1.29 (CRUCIAL pour trouver kubelet)
+# 2. Configuration du Dépôt Kubernetes v1.29
 - name: Créer le dossier pour la clé de dépôt
   file:
     path: /etc/apt/keyrings
@@ -87,10 +87,15 @@
     mode: '0600'
   when: "'master' in ansible_hostname"
 
-- name: Attendre que l'API Server soit prêt
+- name: Pause de sécurité pour stabilisation de l'API
+  pause:
+    seconds: 30
+  when: "'master' in ansible_hostname"
+
+- name: Attendre que l'API Server soit prêt (Port 6443)
   wait_for:
     port: 6443
-    delay: 15
+    delay: 5
     timeout: 300
   when: "'master' in ansible_hostname"
 
@@ -99,8 +104,8 @@
   become_user: ubuntu
   command: kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/tigera-operator.yaml --validate=false
   register: tigera_res
-  retries: 5
-  delay: 20
+  retries: 15
+  delay: 15
   until: tigera_res is succeeded
   when: "'master' in ansible_hostname"
 
@@ -109,8 +114,8 @@
   become_user: ubuntu
   command: kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/custom-resources.yaml --validate=false
   register: calico_res
-  retries: 5
-  delay: 20
+  retries: 10
+  delay: 15
   until: calico_res is succeeded
   when: "'master' in ansible_hostname"
 
@@ -118,7 +123,7 @@
 - name: Rejoindre le cluster automatiquement
   command: kubeadm join 172.16.1.128:6443 --token=abcdef.1234567890abcdef --discovery-token-unsafe-skip-ca-verification
   register: worker_join
-  retries: 10
+  retries: 20
   delay: 30
   until: worker_join is succeeded
   args:
