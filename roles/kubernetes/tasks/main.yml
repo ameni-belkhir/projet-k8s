@@ -1,6 +1,5 @@
 ---
-- name: Deployment of Kubernetes Cluster with Docker and CRI-Dockerd
-  hosts: all
+- hosts: all
   become: yes
   tasks:
     # 1. System Preparation
@@ -22,7 +21,14 @@
         regexp: '^([^#].*?\sswap\s+.*)$'
         replace: '# \1'
 
-    - name: Load kernel modules
+    - name: Ensure kernel modules persist on reboot
+      copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: |
+          overlay
+          br_netfilter
+
+    - name: Load kernel modules immediately
       modprobe:
         name: "{{ item }}"
         state: present
@@ -42,6 +48,12 @@
         - { key: 'net.ipv4.ip_forward', value: '1' }
 
     # 2. Dependencies and Runtimes
+    - name: Install prerequisite packages
+      apt:
+        name: [apt-transport-https, ca-certificates, curl, gnupg]
+        state: present
+        update_cache: yes
+
     - name: Create keyrings directory
       file:
         path: /etc/apt/keyrings
@@ -66,7 +78,7 @@
         state: present
         update_cache: yes
 
-    # --- THE CRI-DOCKERD FIX (Required for K8s 1.24+) ---
+    # --- THE CRI-DOCKERD FIX ---
     - name: Download cri-dockerd package
       get_url:
         url: https://github.com/Mirantis/cri-dockerd/releases/download/v0.3.10/cri-dockerd_0.3.10.3-0.ubuntu-jammy_amd64.deb
@@ -107,24 +119,24 @@
       register: kubeadm_init
       args:
         creates: /etc/kubernetes/admin.conf
-      when: "'master' in ansible_hostname"
+      when: "'master' in inventory_hostname"
 
     - name: Configure kubeconfig for Ubuntu user
       shell: |
         mkdir -p /home/ubuntu/.kube
         cp -f /etc/kubernetes/admin.conf /home/ubuntu/.kube/config
         chown ubuntu:ubuntu /home/ubuntu/.kube/config
-      when: "'master' in ansible_hostname"
+      when: "'master' in inventory_hostname"
 
     # 4. Networking (Calico)
     - name: Install Calico Operator
       command: kubectl --kubeconfig /etc/kubernetes/admin.conf create -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/tigera-operator.yaml
-      when: "'master' in ansible_hostname"
+      when: "'master' in inventory_hostname"
       ignore_errors: yes
 
     - name: Install Calico Custom Resources
       command: kubectl --kubeconfig /etc/kubernetes/admin.conf create -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/custom-resources.yaml
-      when: "'master' in ansible_hostname"
+      when: "'master' in inventory_hostname"
       ignore_errors: yes
 
     # 5. Worker Node Logic
@@ -136,4 +148,4 @@
         --cri-socket unix:///var/run/cri-dockerd.sock
       args:
         creates: /etc/kubernetes/kubelet.conf
-      when: "'worker' in ansible_hostname"
+      when: "'worker' in inventory_hostname"
