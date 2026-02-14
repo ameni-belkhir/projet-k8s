@@ -1,7 +1,7 @@
 ---
-- hosts: localhost
-  connection: local
-  become: yes  # Très important : permet de passer en sudo automatiquement
+- name: Full Master Deployment (K8s + Monitoring)
+  hosts: all
+  become: yes
   roles:
     - kubernetes
     - monitoring
