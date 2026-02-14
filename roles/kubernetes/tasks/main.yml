@@ -1,148 +1,149 @@
 ---
-    # 1. System Preparation
-    - name: Remove old Kubernetes repositories
-      file:
-        path: "{{ item }}"
-        state: absent
-      loop:
-        - /etc/apt/sources.list.d/kubernetes.list
-        - /etc/apt/keyrings/kubernetes-apt-keyring.asc
+# 1. System Preparation (Common to all nodes)
+- name: Remove old Kubernetes repositories
+  file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/apt/sources.list.d/kubernetes.list
+    - /etc/apt/keyrings/kubernetes-apt-keyring.asc
 
-    - name: Disable Swap immediately
-      command: swapoff -a
-      when: ansible_swaptotal_mb > 0
+- name: Disable Swap immediately
+  command: swapoff -a
+  when: ansible_swaptotal_mb > 0
 
-    - name: Disable Swap permanently in fstab
-      replace:
-        path: /etc/fstab
-        regexp: '^([^#].*?\sswap\s+.*)$'
-        replace: '# \1'
+- name: Disable Swap permanently in fstab
+  replace:
+    path: /etc/fstab
+    regexp: '^([^#].*?\sswap\s+.*)$'
+    replace: '# \1'
 
-    - name: Ensure kernel modules persist on reboot
-      copy:
-        dest: /etc/modules-load.d/k8s.conf
-        content: |
-          overlay
-          br_netfilter
+- name: Ensure kernel modules persist on reboot
+  copy:
+    dest: /etc/modules-load.d/k8s.conf
+    content: |
+      overlay
+      br_netfilter
 
-    - name: Load kernel modules immediately
-      modprobe:
-        name: "{{ item }}"
-        state: present
-      loop:
-        - overlay
-        - br_netfilter
+- name: Load kernel modules immediately
+  modprobe:
+    name: "{{ item }}"
+    state: present
+  loop:
+    - overlay
+    - br_netfilter
 
-    - name: Configure sysctl for networking
-      sysctl:
-        name: "{{ item.key }}"
-        value: "{{ item.value }}"
-        state: present
-        reload: yes
-        sysctl_file: /etc/sysctl.d/k8s.conf
-      loop:
-        - { key: 'net.bridge.bridge-nf-call-iptables', value: '1' }
-        - { key: 'net.ipv4.ip_forward', value: '1' }
+- name: Configure sysctl for networking
+  sysctl:
+    name: "{{ item.key }}"
+    value: "{{ item.value }}"
+    state: present
+    reload: yes
+    sysctl_file: /etc/sysctl.d/k8s.conf
+  loop:
+    - { key: 'net.bridge.bridge-nf-call-iptables', value: '1' }
+    - { key: 'net.ipv4.ip_forward', value: '1' }
 
-    # 2. Dependencies and Runtimes
-    - name: Install prerequisite packages
-      apt:
-        name: [apt-transport-https, ca-certificates, curl, gnupg]
-        state: present
-        update_cache: yes
+# 2. Dependencies and Runtimes (Common to all nodes)
+- name: Install prerequisite packages
+  apt:
+    name: [apt-transport-https, ca-certificates, curl, gnupg]
+    state: present
+    update_cache: yes
 
-    - name: Create keyrings directory
-      file:
-        path: /etc/apt/keyrings
-        state: directory
-        mode: '0755'
+- name: Create keyrings directory
+  file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: '0755'
 
-    - name: Download Kubernetes GPG key
-      get_url:
-        url: https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key
-        dest: /etc/apt/keyrings/kubernetes-apt-keyring.asc
-        mode: '0644'
+- name: Download Kubernetes GPG key
+  get_url:
+    url: https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key
+    dest: /etc/apt/keyrings/kubernetes-apt-keyring.asc
+    mode: '0644'
 
-    - name: Add Kubernetes v1.29 repository
-      apt_repository:
-        repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.asc] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /"
-        state: present
-        filename: kubernetes
+- name: Add Kubernetes v1.29 repository
+  apt_repository:
+    repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.asc] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /"
+    state: present
+    filename: kubernetes
 
-    - name: Install Docker and K8s tools
-      apt:
-        name: [docker.io, kubelet, kubeadm, kubectl]
-        state: present
-        update_cache: yes
+- name: Install Docker and K8s tools
+  apt:
+    name: [docker.io, kubelet, kubeadm, kubectl]
+    state: present
+    update_cache: yes
 
-    # --- THE CRI-DOCKERD FIX ---
-    - name: Download cri-dockerd package
-      get_url:
-        url: https://github.com/Mirantis/cri-dockerd/releases/download/v0.3.10/cri-dockerd_0.3.10.3-0.ubuntu-jammy_amd64.deb
-        dest: /tmp/cri-dockerd.deb
+# --- THE CRI-DOCKERD FIX (Common to all nodes) ---
+- name: Download cri-dockerd package
+  get_url:
+    url: https://github.com/Mirantis/cri-dockerd/releases/download/v0.3.10/cri-dockerd_0.3.10.3-0.ubuntu-jammy_amd64.deb
+    dest: /tmp/cri-dockerd.deb
 
-    - name: Install cri-dockerd
-      apt:
-        deb: /tmp/cri-dockerd.deb
-        state: present
+- name: Install cri-dockerd
+  apt:
+    deb: /tmp/cri-dockerd.deb
+    state: present
 
-    - name: Configure Docker Cgroup Driver to Systemd
-      copy:
-        dest: /etc/docker/daemon.json
-        content: |
-          {
-            "exec-opts": ["native.cgroupdriver=systemd"],
-            "log-driver": "json-file",
-            "log-opts": { "max-size": "100m" },
-            "storage-driver": "overlay2"
-          }
+- name: Configure Docker Cgroup Driver to Systemd
+  copy:
+    dest: /etc/docker/daemon.json
+    content: |
+      {
+        "exec-opts": ["native.cgroupdriver=systemd"],
+        "log-driver": "json-file",
+        "log-opts": { "max-size": "100m" },
+        "storage-driver": "overlay2"
+      }
 
-    - name: Restart and Enable Docker & cri-dockerd
-      systemd:
-        name: "{{ item }}"
-        state: restarted
-        enabled: yes
-        daemon_reload: yes
-      loop: [docker, cri-docker]
+- name: Restart and Enable Docker & cri-dockerd
+  systemd:
+    name: "{{ item }}"
+    state: restarted
+    enabled: yes
+    daemon_reload: yes
+  loop: [docker, cri-docker]
 
-    # 3. Master Node Initialization
-    - name: Initialize Kubernetes Master
-      command: >
-        kubeadm init 
-        --pod-network-cidr=192.168.0.0/16 
-        --token=abcdef.1234567890abcdef 
-        --cri-socket unix:///var/run/cri-dockerd.sock 
-        --ignore-preflight-errors=all
-      register: kubeadm_init
-      args:
-        creates: /etc/kubernetes/admin.conf
-      when: "'master' in inventory_hostname"
+# 3. Master Node Initialization (Master Only)
+- name: Initialize Kubernetes Master
+  command: >
+    kubeadm init 
+    --pod-network-cidr=192.168.0.0/16 
+    --token=abcdef.1234567890abcdef 
+    --cri-socket unix:///var/run/cri-dockerd.sock 
+    --ignore-preflight-errors=all
+  register: kubeadm_init
+  args:
+    creates: /etc/kubernetes/admin.conf
+  when: "'master' in ansible_hostname or inventory_hostname == 'localhost'"
 
-    - name: Configure kubeconfig for Ubuntu user
-      shell: |
-        mkdir -p /home/ubuntu/.kube
-        cp -f /etc/kubernetes/admin.conf /home/ubuntu/.kube/config
-        chown ubuntu:ubuntu /home/ubuntu/.kube/config
-      when: "'master' in inventory_hostname"
+- name: Configure kubeconfig for Ubuntu user
+  shell: |
+    mkdir -p /home/ubuntu/.kube
+    cp -f /etc/kubernetes/admin.conf /home/ubuntu/.kube/config
+    chown ubuntu:ubuntu /home/ubuntu/.kube/config
+  when: "'master' in ansible_hostname or inventory_hostname == 'localhost'"
 
-    # 4. Networking (Calico)
-    - name: Install Calico Operator
-      command: kubectl --kubeconfig /etc/kubernetes/admin.conf create -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/tigera-operator.yaml
-      when: "'master' in inventory_hostname"
-      ignore_errors: yes
+# 4. Networking - Calico (Master Only)
+- name: Install Calico Operator
+  command: kubectl --kubeconfig /etc/kubernetes/admin.conf create -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/tigera-operator.yaml
+  when: "'master' in ansible_hostname or inventory_hostname == 'localhost'"
+  ignore_errors: yes
 
-    - name: Install Calico Custom Resources
-      command: kubectl --kubeconfig /etc/kubernetes/admin.conf create -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/custom-resources.yaml
-      when: "'master' in inventory_hostname"
-      ignore_errors: yes
+- name: Install Calico Custom Resources
+  command: kubectl --kubeconfig /etc/kubernetes/admin.conf create -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/custom-resources.yaml
+  when: "'master' in ansible_hostname or inventory_hostname == 'localhost'"
+  ignore_errors: yes
 
-    # 5. Worker Node Logic
-    - name: Join Worker nodes to Cluster
-      command: >
-        kubeadm join 172.16.1.128:6443 
-        --token=abcdef.1234567890abcdef 
-        --discovery-token-unsafe-skip-ca-verification 
-        --cri-socket unix:///var/run/cri-dockerd.sock
-      args:
-        creates: /etc/kubernetes/kubelet.conf
-      when: "'worker' in inventory_hostname"
+# 5. Worker Node Logic (Workers Only)
+- name: Join Worker nodes to Cluster
+  command: >
+    kubeadm join 172.16.1.128:6443 
+    --token=abcdef.1234567890abcdef 
+    --discovery-token-unsafe-skip-ca-verification 
+    --cri-socket unix:///var/run/cri-dockerd.sock
+  args:
+    creates: /etc/kubernetes/kubelet.conf
+  # This runs only if the machine is a worker and NOT the local master node
+  when: "'worker' in ansible_hostname and inventory_hostname != 'localhost'"
