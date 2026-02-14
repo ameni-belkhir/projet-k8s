@@ -10,4 +10,4 @@
     token: "abcdef.1234567890abcdef"
   roles:
     - kubernetes
-    - monitoring
+    
