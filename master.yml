@@ -3,7 +3,7 @@
   hosts: localhost  
   connection: local 
   become: yes
-   vars:
+  vars:
     # Cette variable récupère la valeur passée par -e "master_ip_extra=..."
     # Si rien n'est passé, elle vaut 127.0.0.1 par défaut
     master_ip: "{{ master_ip_extra | default('127.0.0.1') }}"
