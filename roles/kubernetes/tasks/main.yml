@@ -1,7 +1,4 @@
 ---
-- hosts: all
-  become: yes
-  tasks:
     # 1. System Preparation
     - name: Remove old Kubernetes repositories
       file:
