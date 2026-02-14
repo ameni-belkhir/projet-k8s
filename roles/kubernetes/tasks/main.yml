@@ -11,7 +11,7 @@
         apt-get install -f -y
       ignore_errors: yes
 
-    # 2. System Preparation (Common)
+    # 2. System Preparation
     # -------------------------------------------------------------------------
     - name: Remove old Kubernetes repositories
       file:
@@ -52,17 +52,9 @@
         mode: '0755'
 
     - name: Setup Kubernetes Repository
-      block:
-        - name: Download GPG key
-          get_url:
-            url: https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key
-            dest: /etc/apt/keyrings/kubernetes-apt-keyring.asc
-            mode: '0644'
-        - name: Add Repository
-          apt_repository:
-            repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.asc] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /"
-            state: present
-            filename: kubernetes
+      shell: |
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg --yes
+        echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /" > /etc/apt/sources.list.d/kubernetes.list
 
     - name: Install Docker and K8s tools
       apt:
@@ -82,10 +74,10 @@
 
     - name: Install and Start cri-dockerd
       block:
-        - name: Download cri-dockerd
-          get_url:
-            url: https://github.com/Mirantis/cri-dockerd/releases/download/v0.3.10/cri-dockerd_0.3.10.3-0.ubuntu-jammy_amd64.deb
-            dest: /tmp/cri-dockerd.deb
+        - name: Download cri-dockerd (Fix corrupted download)
+          shell: |
+            cd /tmp
+            curl -L -o cri-dockerd.deb https://github.com/Mirantis/cri-dockerd/releases/download/v0.3.10/cri-dockerd_0.3.10.3-0.ubuntu-jammy_amd64.deb
         - name: Install deb
           apt:
             deb: /tmp/cri-dockerd.deb
@@ -103,7 +95,7 @@
     - name: Initialize Kubernetes Master
       command: >
         kubeadm init --pod-network-cidr=192.168.0.0/16 
-        --token=abcdef.1234567890abcdef 
+        --token={{ token }} 
         --cri-socket unix:///var/run/cri-dockerd.sock 
         --ignore-preflight-errors=all
       args:
@@ -113,7 +105,11 @@
     - name: Setup Kubeconfig for Ubuntu
       block:
         - name: Create kube dir
-          file: path=/home/ubuntu/.kube state=directory owner=ubuntu group=ubuntu
+          file:
+            path: /home/ubuntu/.kube
+            state: directory
+            owner: ubuntu
+            group: ubuntu
         - name: Copy admin.conf
           copy:
             src: /etc/kubernetes/admin.conf
@@ -160,12 +156,12 @@
           register: helm_out
           failed_when: "helm_out.rc != 0 and 'already exists' not in helm_out.stderr"
 
-    # 6. Worker Node Logic
+    # 6. Worker Node Logic (FIXED IP)
     # -------------------------------------------------------------------------
     - name: Join Worker nodes to Cluster
       command: >
-        kubeadm join {{ hostvars['k8s-master']['ansible_default_ipv4']['address'] }}:6443 
-        --token=abcdef.1234567890abcdef 
+        kubeadm join {{ master_ip }}:6443 
+        --token={{ token }} 
         --discovery-token-unsafe-skip-ca-verification 
         --cri-socket unix:///var/run/cri-dockerd.sock
       args:
