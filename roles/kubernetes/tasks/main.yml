@@ -1,157 +1,139 @@
 ---
-# 1. Nettoyage et Préparation Système
-- name: Supprimer anciens dépôts
-  file:
-    path: "{{ item }}"
-    state: absent
-  loop:
-    - /etc/apt/sources.list.d/kubernetes.list
-    - /etc/apt/keyrings/kubernetes-apt-keyring.asc
+- name: Deployment of Kubernetes Cluster with Docker and CRI-Dockerd
+  hosts: all
+  become: yes
+  tasks:
+    # 1. System Preparation
+    - name: Remove old Kubernetes repositories
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/apt/sources.list.d/kubernetes.list
+        - /etc/apt/keyrings/kubernetes-apt-keyring.asc
 
-- name: Désactiver le swap
-  command: swapoff -a
-  when: ansible_swaptotal_mb > 0
+    - name: Disable Swap immediately
+      command: swapoff -a
+      when: ansible_swaptotal_mb > 0
 
-- name: Charger les modules noyau nécessaires
-  modprobe:
-    name: "{{ item }}"
-    state: present
-  loop:
-    - overlay
-    - br_netfilter
+    - name: Disable Swap permanently in fstab
+      replace:
+        path: /etc/fstab
+        regexp: '^([^#].*?\sswap\s+.*)$'
+        replace: '# \1'
 
-- name: Configuration sysctl réseau
-  sysctl:
-    name: "{{ item.key }}"
-    value: "{{ item.value }}"
-    state: present
-    reload: yes
-    sysctl_file: /etc/sysctl.d/k8s.conf
-  loop:
-    - { key: 'net.bridge.bridge-nf-call-iptables', value: '1' }
-    - { key: 'net.ipv4.ip_forward', value: '1' }
+    - name: Load kernel modules
+      modprobe:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - overlay
+        - br_netfilter
 
-# 2. Configuration du Dépôt et Installation
-- name: Créer le dossier pour la clé de dépôt
-  file:
-    path: /etc/apt/keyrings
-    state: directory
-    mode: '0755'
+    - name: Configure sysctl for networking
+      sysctl:
+        name: "{{ item.key }}"
+        value: "{{ item.value }}"
+        state: present
+        reload: yes
+        sysctl_file: /etc/sysctl.d/k8s.conf
+      loop:
+        - { key: 'net.bridge.bridge-nf-call-iptables', value: '1' }
+        - { key: 'net.ipv4.ip_forward', value: '1' }
 
-- name: Télécharger la clé GPG officielle Kubernetes
-  get_url:
-    url: https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key
-    dest: /etc/apt/keyrings/kubernetes-apt-keyring.asc
-    mode: '0644'
+    # 2. Dependencies and Runtimes
+    - name: Create keyrings directory
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
 
-- name: Ajouter le dépôt Kubernetes v1.29
-  apt_repository:
-    repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.asc] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /"
-    state: present
-    filename: kubernetes
+    - name: Download Kubernetes GPG key
+      get_url:
+        url: https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key
+        dest: /etc/apt/keyrings/kubernetes-apt-keyring.asc
+        mode: '0644'
 
-- name: Installer Docker et Outils K8s
-  apt:
-    name: [docker.io, kubelet, kubeadm, kubectl]
-    state: present
-    update_cache: yes
+    - name: Add Kubernetes v1.29 repository
+      apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.asc] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /"
+        state: present
+        filename: kubernetes
 
-# --- CORRECTION CRUCIALE : CGROUP DRIVER ---
-- name: Configurer Docker pour utiliser systemd (évite le CrashLoopBackOff)
-  copy:
-    dest: /etc/docker/daemon.json
-    content: |
-      {
-        "exec-opts": ["native.cgroupdriver=systemd"],
-        "log-driver": "json-file",
-        "log-opts": { "max-size": "100m" },
-        "storage-driver": "overlay2"
-      }
-  register: docker_config
+    - name: Install Docker and K8s tools
+      apt:
+        name: [docker.io, kubelet, kubeadm, kubectl]
+        state: present
+        update_cache: yes
 
-- name: Redémarrer Docker si configuration modifiée
-  systemd:
-    name: docker
-    state: restarted
-    enabled: yes
-    daemon_reload: yes
-  when: docker_config.changed
+    # --- THE CRI-DOCKERD FIX (Required for K8s 1.24+) ---
+    - name: Download cri-dockerd package
+      get_url:
+        url: https://github.com/Mirantis/cri-dockerd/releases/download/v0.3.10/cri-dockerd_0.3.10.3-0.ubuntu-jammy_amd64.deb
+        dest: /tmp/cri-dockerd.deb
 
-- name: Redémarrer Kubelet
-  systemd:
-    name: kubelet
-    state: restarted
-    enabled: yes
-# ------------------------------------------
+    - name: Install cri-dockerd
+      apt:
+        deb: /tmp/cri-dockerd.deb
+        state: present
 
-# 4. Logique MASTER
-- name: Initialiser le Master Kubernetes
-  command: kubeadm init --pod-network-cidr=192.168.0.0/16 --token=abcdef.1234567890abcdef --ignore-preflight-errors=all
-  register: kubeadm_init
-  retries: 3
-  delay: 30
-  until: kubeadm_init is succeeded
-  when: "'master' in ansible_hostname"
-  args:
-    creates: /etc/kubernetes/admin.conf
+    - name: Configure Docker Cgroup Driver to Systemd
+      copy:
+        dest: /etc/docker/daemon.json
+        content: |
+          {
+            "exec-opts": ["native.cgroupdriver=systemd"],
+            "log-driver": "json-file",
+            "log-opts": { "max-size": "100m" },
+            "storage-driver": "overlay2"
+          }
 
-- name: Créer le répertoire .kube
-  file:
-    path: /home/ubuntu/.kube
-    state: directory
-    owner: ubuntu
-    group: ubuntu
-    mode: '0755'
-  when: "'master' in ansible_hostname"
+    - name: Restart and Enable Docker & cri-dockerd
+      systemd:
+        name: "{{ item }}"
+        state: restarted
+        enabled: yes
+        daemon_reload: yes
+      loop: [docker, cri-docker]
 
-- name: Configurer kubectl (Copie du config)
-  copy:
-    src: /etc/kubernetes/admin.conf
-    dest: /home/ubuntu/.kube/config
-    remote_src: yes
-    owner: ubuntu
-    group: ubuntu
-    mode: '0600'
-  when: "'master' in ansible_hostname"
+    # 3. Master Node Initialization
+    - name: Initialize Kubernetes Master
+      command: >
+        kubeadm init 
+        --pod-network-cidr=192.168.0.0/16 
+        --token=abcdef.1234567890abcdef 
+        --cri-socket unix:///var/run/cri-dockerd.sock 
+        --ignore-preflight-errors=all
+      register: kubeadm_init
+      args:
+        creates: /etc/kubernetes/admin.conf
+      when: "'master' in ansible_hostname"
 
-- name: Pause de sécurité pour stabilisation de l'API
-  pause:
-    seconds: 30
-  when: "'master' in ansible_hostname"
+    - name: Configure kubeconfig for Ubuntu user
+      shell: |
+        mkdir -p /home/ubuntu/.kube
+        cp -f /etc/kubernetes/admin.conf /home/ubuntu/.kube/config
+        chown ubuntu:ubuntu /home/ubuntu/.kube/config
+      when: "'master' in ansible_hostname"
 
-- name: Attendre que l'API Server soit prêt via kubectl
-  command: kubectl --kubeconfig /etc/kubernetes/admin.conf get nodes
-  register: api_ready
-  retries: 20
-  delay: 10
-  until: api_ready is succeeded
-  when: "'master' in ansible_hostname"
+    # 4. Networking (Calico)
+    - name: Install Calico Operator
+      command: kubectl --kubeconfig /etc/kubernetes/admin.conf create -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/tigera-operator.yaml
+      when: "'master' in ansible_hostname"
+      ignore_errors: yes
 
-- name: Installer l'Operator Tigera (Calico)
-  command: kubectl --kubeconfig /etc/kubernetes/admin.conf create -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/tigera-operator.yaml --validate=false
-  register: tigera_res
-  retries: 10
-  delay: 15
-  until: tigera_res is succeeded
-  when: "'master' in ansible_hostname"
-  ignore_errors: yes
+    - name: Install Calico Custom Resources
+      command: kubectl --kubeconfig /etc/kubernetes/admin.conf create -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/custom-resources.yaml
+      when: "'master' in ansible_hostname"
+      ignore_errors: yes
 
-- name: Installer les ressources Calico
-  command: kubectl --kubeconfig /etc/kubernetes/admin.conf create -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/custom-resources.yaml --validate=false
-  register: calico_res
-  retries: 10
-  delay: 15
-  until: calico_res is succeeded
-  when: "'master' in ansible_hostname"
-  ignore_errors: yes
-
-# 5. Logique WORKER
-- name: Rejoindre le cluster automatiquement
-  command: kubeadm join 172.16.1.128:6443 --token=abcdef.1234567890abcdef --discovery-token-unsafe-skip-ca-verification
-  register: worker_join
-  retries: 20
-  delay: 30
-  until: worker_join is succeeded
-  args:
-    creates: /etc/kubernetes/kubelet.conf
-  when: "'worker' in ansible_hostname"
+    # 5. Worker Node Logic
+    - name: Join Worker nodes to Cluster
+      command: >
+        kubeadm join 172.16.1.128:6443 
+        --token=abcdef.1234567890abcdef 
+        --discovery-token-unsafe-skip-ca-verification 
+        --cri-socket unix:///var/run/cri-dockerd.sock
+      args:
+        creates: /etc/kubernetes/kubelet.conf
+      when: "'worker' in ansible_hostname"
