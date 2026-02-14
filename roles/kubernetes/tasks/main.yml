@@ -133,7 +133,7 @@
 
 - name: Install Calico Custom Resources
   command: kubectl --kubeconfig /etc/kubernetes/admin.conf create -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/custom-resources.yaml
-  when: "'master' in ansible_hostname or inventory_hostname == 'localhost'"
+  when: "'master' in ansible_hostname"
   ignore_errors: yes
 
 # 5. Worker Node Logic (Workers Only)
@@ -146,4 +146,4 @@
   args:
     creates: /etc/kubernetes/kubelet.conf
   # This runs only if the machine is a worker and NOT the local master node
-  when: "'worker' in ansible_hostname and inventory_hostname != 'localhost'"
+  when: "'worker' in ansible_hostname"
