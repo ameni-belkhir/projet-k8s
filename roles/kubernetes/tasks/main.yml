@@ -1,5 +1,44 @@
 ---
-# A. Nettoyage et Préparation
+# A. Préparation Système et Dépendances
+# -------------------------------------------------------------------------
+- name: Installer les dépendances APT
+  apt:
+    name: [ 'apt-transport-https', 'ca-certificates', 'curl', 'gnupg' ]
+    state: present
+    update_cache: yes
+
+- name: Créer le dossier pour la clé du dépôt K8s
+  file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: '0755'
+
+- name: Ajouter la clé GPG de Kubernetes
+  shell: |
+    curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.28/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+  args:
+    creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+- name: Ajouter le dépôt APT de Kubernetes
+  copy:
+    dest: /etc/apt/sources.list.d/kubernetes.list
+    content: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.28/deb/ /"
+
+# B. Installation des binaires (Ce qui manquait !)
+# -------------------------------------------------------------------------
+- name: Installer kubeadm, kubelet et kubectl
+  apt:
+    name: [ 'kubelet', 'kubeadm', 'kubectl' ]
+    state: present
+    update_cache: yes
+
+- name: Empêcher la mise à jour automatique de K8s (Hold)
+  dpkg_selections:
+    name: "{{ item }}"
+    selection: hold
+  loop: [ 'kubelet', 'kubeadm', 'kubectl' ]
+
+# C. Nettoyage et Préparation Réseau
 # -------------------------------------------------------------------------
 - name: Nettoyer les résidus CNI et verrous
   shell: |
@@ -7,7 +46,7 @@
     while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do sleep 5; done;
   ignore_errors: yes
 
-# B. Initialisation (Master)
+# D. Initialisation (Master uniquement)
 # -------------------------------------------------------------------------
 - name: Initialiser le Master
   command: >
@@ -19,26 +58,26 @@
     creates: /etc/kubernetes/admin.conf
   when: node_role == "master"
 
-- name: Configurer Kubeconfig
+- name: Configurer Kubeconfig pour l'utilisateur ubuntu
   shell: |
     mkdir -p /home/ubuntu/.kube
     cp /etc/kubernetes/admin.conf /home/ubuntu/.kube/config
     chown ubuntu:ubuntu /home/ubuntu/.kube/config
   when: node_role == "master"
 
-# C. Réseau Calico (La base de la communication)
+# E. Réseau Calico (Communication entre pods)
 # -------------------------------------------------------------------------
 - name: Installer Calico via l'Opérateur
   become: yes
   become_user: ubuntu
   shell: |
     kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/tigera-operator.yaml
-    sleep 10
+    sleep 5
     kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/custom-resources.yaml
   when: node_role == "master"
   ignore_errors: yes
 
-# D. Jointure (Worker)
+# F. Jointure (Worker uniquement)
 # -------------------------------------------------------------------------
 - name: Joindre le Cluster
   command: >
