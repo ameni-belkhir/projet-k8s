@@ -7,19 +7,20 @@
 - name: Ajouter le dépôt Prometheus
   become: yes
   become_user: ubuntu
-  kubernetes.core.helm_repository:
-    name: prometheus-community
-    repo_url: "https://prometheus-community.github.io/helm-charts"
+  shell: |
+    helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+    helm repo update
 
 - name: Déployer la Stack Monitoring (Prometheus & Grafana)
   become: yes
   become_user: ubuntu
   shell: |
-    helm repo update
+    export KUBECONFIG=/etc/kubernetes/admin.conf
     helm upgrade --install prometheus prometheus-community/kube-prometheus-stack \
       --namespace monitoring \
       --create-namespace \
-      --set grafana.enabled=true
+      --set grafana.enabled=true \
+      --no-hooks
   register: helm_result
   retries: 3
   delay: 15
