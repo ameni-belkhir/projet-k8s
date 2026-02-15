@@ -1,9 +1,11 @@
+
+Vous avez envoyé
 ---
 # ==================== RÉCUPÉRER LES VARIABLES D'ENVIRONNEMENT ====================
 - name: Récupérer les variables d'environnement
   set_fact:
-    node_role: "{{ lookup('env', 'NODE_ROLE') }}"
-    master_ip: "{{ lookup('env', 'MASTER_IP') | default('') }}"
+    node_role: "{{ lookup('env', 'NODE_ROLE') | default(node_role | default('')) }}"
+    master_ip: "{{ lookup('env', 'MASTER_IP') | default(master_ip | default('')) }}"
     token: "{{ lookup('env', 'TOKEN') | default('abcdef.1234567890abcdef') }}"
 
 - name: Afficher la configuration
@@ -85,14 +87,24 @@
 
     - name: Installer et démarrer cri-dockerd
       block:
-        - name: Télécharger cri-dockerd
+        - name: Supprimer tout ancien fichier corrompu
+          file:
+            path: /tmp/cri-dockerd.deb
+            state: absent
+
+        - name: Télécharger cri-dockerd (v0.3.11)
           get_url:
-            url: https://github.com/Mirantis/cri-dockerd/releases/download/v0.3.10/cri-dockerd_0.3.10.3-0.ubuntu-jammy_amd64.deb
+            url: "https://github.com/Mirantis/cri-dockerd/releases/download/v0.3.11/cri-dockerd_0.3.11.3-0.ubuntu-jammy_amd64.deb"
             dest: /tmp/cri-dockerd.deb
+            mode: '0644'
+            force: yes  # Force le retéléchargement pour garantir l'intégrité
+            timeout: 60
+
         - name: Installer le paquet .deb
           apt:
             deb: /tmp/cri-dockerd.deb
             state: present
+
         - name: Redémarrer les services
           systemd:
             name: "{{ item }}"
