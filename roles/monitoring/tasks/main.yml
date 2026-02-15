@@ -2,13 +2,18 @@
 # ==================== RÉCUPÉRER LE RÔLE ====================
 - name: Récupérer le rôle depuis l'environnement
   set_fact:
-    node_role: "{{ lookup('env', 'NODE_ROLE') }}"
-    master_ip: "{{ lookup('env', 'MASTER_IP') | default('') }}"
+    node_role: "{{ lookup('env', 'NODE_ROLE') | default(node_role | default('')) }}"
+    master_ip: "{{ lookup('env', 'MASTER_IP') | default(master_ip | default('')) }}"
 
 # ==================== CALICO NETWORK (Master seulement) ====================
 - name: "📦 Installation de Calico Network (Master seulement)"
   when: node_role == "master"
   block:
+    - name: Configurer les permissions sur admin.conf pour l'utilisateur ubuntu
+      file:
+        path: /etc/kubernetes/admin.conf
+        mode: '0644'
+
     - name: Installer l'opérateur Tigera Calico
       become: yes
       become_user: ubuntu
@@ -29,13 +34,12 @@
           --selector name=tigera-operator \
           --timeout=120s
       register: operator_ready
+      until: operator_ready.rc == 0
       retries: 5
       delay: 10
-      until: operator_ready.rc == 0
       ignore_errors: yes
 
     - name: Créer le fichier de configuration Calico
-      become: yes
       copy:
         dest: /home/ubuntu/custom-resources.yaml
         content: |
@@ -65,33 +69,17 @@
       become_user: ubuntu
       shell: |
         kubectl apply -f /home/ubuntu/custom-resources.yaml
-      register: calico_apply
 
-    - name: Attendre que les pods Calico soient prêts
+    - name: Attendre que les pods Calico soient prêts (Crucial avant Helm)
       become: yes
       become_user: ubuntu
       shell: |
-        kubectl wait --namespace calico-system \
-          --for=condition=ready pod \
-          --all \
-          --timeout=180s
+        kubectl wait --namespace calico-system --for=condition=ready pod --all --timeout=300s
       register: calico_ready
-      retries: 5
-      delay: 15
       until: calico_ready.rc == 0
+      retries: 3
+      delay: 20
       ignore_errors: yes
-
-    - name: Vérifier l'état de Calico
-      become: yes
-      become_user: ubuntu
-      shell: |
-        kubectl get pods -n calico-system
-      register: calico_pods
-      changed_when: false
-
-    - name: Afficher l'état de Calico
-      debug:
-        msg: "📦 Calico pods: {{ calico_pods.stdout_lines }}"
 
 # ==================== PROMETHEUS/GRAFANA (Master seulement) ====================
 - name: "📊 Installation de Prometheus Stack (Master seulement)"
@@ -110,130 +98,43 @@
       shell: |
         helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
         helm repo update
-      register: helm_repo
 
-    - name: Créer le fichier de valeurs (sans stockage persistant)
-      become: yes
+    - name: Créer le fichier de valeurs Prometheus
       copy:
         dest: /home/ubuntu/prometheus-values.yaml
         content: |
-          # Configuration sans stockage persistant (emptyDir)
           prometheus:
             prometheusSpec:
               retention: 3d
-              resources:
-                requests:
-                  memory: 256Mi
-                  cpu: 100m
-                limits:
-                  memory: 512Mi
-                  cpu: 200m
               storageSpec:
                 emptyDir: {}
-          
-          alertmanager:
-            enabled: true
-            alertmanagerSpec:
-              resources:
-                requests:
-                  memory: 128Mi
-                  cpu: 50m
-                limits:
-                  memory: 256Mi
-                  cpu: 100m
-              storage:
-                emptyDir: {}
-          
           grafana:
-            enabled: true
             adminPassword: "admin"
-            resources:
-              requests:
-                memory: 128Mi
-                cpu: 50m
-              limits:
-                memory: 256Mi
-                cpu: 100m
             persistence:
               enabled: false
             service:
               type: NodePort
               nodePort: 30300
-            testFramework:
-              enabled: false
-          
-          kube-state-metrics:
-            resources:
-              requests:
-                memory: 100Mi
-                cpu: 50m
-              limits:
-                memory: 200Mi
-                cpu: 100m
         owner: ubuntu
         group: ubuntu
 
-    - name: Installer/Mettre à jour la stack Prometheus
+    - name: Installer la stack Prometheus via Helm
       become: yes
       become_user: ubuntu
       shell: |
-        export KUBECONFIG=/etc/kubernetes/admin.conf
         helm upgrade --install prometheus prometheus-community/kube-prometheus-stack \
           --namespace monitoring \
           --create-namespace \
           --values /home/ubuntu/prometheus-values.yaml \
-          --wait \
-          --timeout 5m \
-          --atomic
-      register: helm_install
-      retries: 2
-      delay: 30
-      until: helm_install.rc == 0
-      ignore_errors: yes
-
-    - name: Vérifier l'installation
-      become: yes
-      become_user: ubuntu
-      shell: |
-        kubectl get pods -n monitoring
-      register: pods_status
-      changed_when: false
-
-    - name: Afficher les pods
-      debug:
-        msg: "📊 Monitoring pods: {{ pods_status.stdout_lines }}"
-
-    - name: Obtenir l'IP locale du master
-      shell: hostname -I | awk '{print $1}'
-      register: master_ip_local
-      changed_when: false
+          --wait --timeout 10m
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
 
     - name: Afficher les informations d'accès
       debug:
         msg:
           - "=========================================="
-          - "✅ Stack Prometheus installée avec succès!"
+          - "✅ Cluster K8s et Monitoring opérationnels"
+          - "📊 Grafana: http://{{ ansible_default_ipv4.address }}:30300"
+          - "👤 User: admin / Pass: admin"
           - "=========================================="
-          - "📊 Grafana: http://{{ master_ip_local.stdout }}:30300"
-          - "   Utilisateur: admin"
-          - "   Mot de passe: admin"
-          - ""
-          - "⚠️  Stockage temporaire (emptyDir) - pas de persistance"
-          - "=========================================="
-
-    - name: Créer un fichier d'information
-      copy:
-        content: |
-          Kubernetes Monitoring Stack
-          ==========================
-          Date: {{ ansible_date_time.iso8601 }}
-          
-          Grafana: http://{{ master_ip_local.stdout }}:30300 (admin/admin)
-          
-          Commandes:
-          - kubectl get pods -n monitoring
-          - kubectl logs -n monitoring deployment/prometheus-grafana
-        dest: /home/ubuntu/monitoring-info.txt
-        owner: ubuntu
-        group: ubuntu
-        mode: '0644'
