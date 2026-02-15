@@ -1,116 +1,159 @@
 ---
-# 1. Nettoyage et Réparation Initiale
-# -------------------------------------------------------------------------
-- name: Nettoyer les fichiers corrompus et verrous APT
-  shell: |
-    rm -f /tmp/cri-dockerd.deb
-    rm -f /var/lib/dpkg/lock-frontend
-    apt-get clean
-    apt-get install -f -y
-  ignore_errors: yes
+# ==================== RÉCUPÉRER LES VARIABLES D'ENVIRONNEMENT ====================
+- name: Récupérer les variables d'environnement
+  set_fact:
+    node_role: "{{ lookup('env', 'NODE_ROLE') }}"
+    master_ip: "{{ lookup('env', 'MASTER_IP') | default('') }}"
+    token: "{{ lookup('env', 'TOKEN') | default('abcdef.1234567890abcdef') }}"
 
-# 2. Préparation Système et Dépendances
-# -------------------------------------------------------------------------
-- name: Installer les dépendances APT de base
-  apt:
-    name: [ 'apt-transport-https', 'ca-certificates', 'curl', 'gnupg', 'docker.io', 'containerd', 'runc' ]
-    state: present
-    update_cache: yes
+- name: Afficher la configuration
+  debug:
+    msg: "Configuration - Rôle: {{ node_role }}, Master IP: {{ master_ip }}"
 
-- name: Créer le dossier pour la clé du dépôt K8s
-  file:
-    path: /etc/apt/keyrings
-    state: directory
-    mode: '0755'
+# ==================== TÂCHES COMMUNES (Master & Worker) ====================
+- name: "🔧 TÂCHES COMMUNES - Exécution sur {{ node_role }}"
+  block:
+    # 1. Protection contre les verrous APT & Réparations
+    - name: Attendre que le verrou APT soit libéré
+      shell: while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do sleep 5; done;
+      changed_when: false
 
-- name: Configurer le dépôt Kubernetes v1.28
-  shell: |
-    curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.28/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-    echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.28/deb/ /" > /etc/apt/sources.list.d/kubernetes.list
+    - name: Réparer les installations de paquets interrompues
+      shell: |
+        dpkg --configure -a
+        apt-get install -f -y
+      ignore_errors: yes
 
-# 3. Installation de cri-dockerd (Le connecteur Docker)
-# -------------------------------------------------------------------------
-- name: Télécharger cri-dockerd (Force download pour éviter corruption)
-  get_url:
-    url: https://github.com/Mirantis/cri-dockerd/releases/download/v0.3.4/cri-dockerd_0.3.4.3-0.ubuntu-jammy_amd64.deb
-    dest: /tmp/cri-dockerd.deb
-    force: yes
+    # 2. Préparation du Système (Swap, Modules, Réseau)
+    - name: Supprimer les anciens dépôts Kubernetes
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/apt/sources.list.d/kubernetes.list
+        - /etc/apt/keyrings/kubernetes-apt-keyring.asc
 
-- name: Installer cri-dockerd
-  apt:
-    deb: /tmp/cri-dockerd.deb
+    - name: Désactiver le Swap
+      shell: |
+        swapoff -a
+        sed -i '/\sswap\s/ s/^\(.*\)$/#\1/g' /etc/fstab
+      when: ansible_swaptotal_mb > 0
 
-- name: Debug - Vérifier l'état du socket cri-dockerd
-  command: ls -la /var/run/cri-dockerd.sock
-  register: socket_check
-  ignore_errors: yes
+    - name: Charger les modules noyau
+      modprobe:
+        name: "{{ item }}"
+        state: present
+      loop: [overlay, br_netfilter]
 
-- debug:
-    var: socket_check.stdout
+    - name: Configurer le sysctl pour le réseau
+      sysctl:
+        name: "{{ item.key }}"
+        value: "{{ item.value }}"
+        state: present
+        reload: yes
+      loop:
+        - { key: 'net.bridge.bridge-nf-call-iptables', value: '1' }
+        - { key: 'net.ipv4.ip_forward', value: '1' }
 
-# 4. Installation des binaires K8s
-# -------------------------------------------------------------------------
-- name: Installer kubeadm, kubelet et kubectl
-  apt:
-    name: [ 'kubelet', 'kubeadm', 'kubectl' ]
-    state: present
-    update_cache: yes
+    # 3. Installation des Dépendances & CRI-Dockerd
+    - name: Créer le répertoire keyrings
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
 
-- name: Fixer les versions (Hold)
-  dpkg_selections:
-    name: "{{ item }}"
-    selection: hold
-  loop: [ 'kubelet', 'kubeadm', 'kubectl' ]
+    - name: Configurer le dépôt Kubernetes (v1.29)
+      shell: |
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg --yes
+        echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /" > /etc/apt/sources.list.d/kubernetes.list
 
-# 5. Initialisation (Master uniquement)
-# -------------------------------------------------------------------------
-- name: Initialiser le Master
-  command: >
-    kubeadm init --pod-network-cidr=192.168.0.0/16
-    --token={{ token }}
-    --cri-socket unix:///var/run/cri-dockerd.sock
-    --ignore-preflight-errors=all
-  args:
-    creates: /etc/kubernetes/admin.conf
+    - name: Installer Docker et les outils K8s
+      apt:
+        name: [docker.io, kubelet, kubeadm, kubectl]
+        state: present
+        update_cache: yes
+
+    - name: Configurer Docker (Cgroup systemd)
+      copy:
+        dest: /etc/docker/daemon.json
+        content: |
+          {
+            "exec-opts": ["native.cgroupdriver=systemd"],
+            "log-driver": "json-file",
+            "storage-driver": "overlay2"
+          }
+
+    - name: Installer et démarrer cri-dockerd
+      block:
+        - name: Télécharger cri-dockerd
+          get_url:
+            url: https://github.com/Mirantis/cri-dockerd/releases/download/v0.3.10/cri-dockerd_0.3.10.3-0.ubuntu-jammy_amd64.deb
+            dest: /tmp/cri-dockerd.deb
+        - name: Installer le paquet .deb
+          apt:
+            deb: /tmp/cri-dockerd.deb
+            state: present
+        - name: Redémarrer les services
+          systemd:
+            name: "{{ item }}"
+            state: restarted
+            enabled: yes
+            daemon_reload: yes
+          loop: [docker, cri-docker]
+  when: node_role in ["master", "worker"]
+
+# ==================== TÂCHES SPÉCIFIQUES AU MASTER ====================
+- name: "👑 TÂCHES MASTER - Initialisation du cluster"
   when: node_role == "master"
-  register: kubeinit_output
+  block:
+    - name: Initialiser le Master Kubernetes
+      command: >
+        kubeadm init --pod-network-cidr=192.168.0.0/16 
+        --token={{ token }} 
+        --cri-socket unix:///var/run/cri-dockerd.sock 
+        --ignore-preflight-errors=all
+      args:
+        creates: /etc/kubernetes/admin.conf
 
-- debug:
-    var: kubeinit_output.stdout_lines
-  when: node_role == "master" and kubeinit_output.changed
+    - name: Configurer Kubeconfig pour l'utilisateur ubuntu
+      block:
+        - name: Créer le dossier .kube
+          file:
+            path: /home/ubuntu/.kube
+            state: directory
+            owner: ubuntu
+            group: ubuntu
+        - name: Copier admin.conf
+          copy:
+            src: /etc/kubernetes/admin.conf
+            dest: /home/ubuntu/.kube/config
+            remote_src: yes
+            owner: ubuntu
+            group: ubuntu
+            mode: '0600'
 
-- name: Configurer Kubeconfig pour l'utilisateur ubuntu
-  shell: |
-    mkdir -p /home/ubuntu/.kube
-    cp /etc/kubernetes/admin.conf /home/ubuntu/.kube/config
-    chown ubuntu:ubuntu /home/ubuntu/.kube/config
-  when: node_role == "master"
-
-# 6. Réseau Calico (Master uniquement)
-# -------------------------------------------------------------------------
-- name: Installer Calico
-  become: yes
-  become_user: ubuntu
-  shell: |
-    kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/tigera-operator.yaml
-    sleep 5
-    kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/custom-resources.yaml
-  when: node_role == "master"
-  ignore_errors: yes
-
-# 7. Jointure (Worker uniquement)
-# -------------------------------------------------------------------------
-- name: Joindre le Cluster
-  command: >
-    kubeadm join {{ master_ip }}:6443
-    --token={{ token }}
-    --discovery-token-unsafe-skip-ca-verification
-    --cri-socket unix:///var/run/cri-dockerd.sock
-  args:
-    creates: /etc/kubernetes/kubelet.conf
+# ==================== TÂCHES SPÉCIFIQUES AU WORKER ====================
+- name: "🔧 TÂCHES WORKER - Join au cluster"
   when: node_role == "worker"
-  register: join_output
+  block:
+    - name: Vérifier que l'IP du master est fournie
+      fail:
+        msg: "La variable d'environnement MASTER_IP doit être définie pour les workers"
+      when: master_ip == ""
 
-- debug:
-    var: join_output.stdout
-  when: node_role == "worker"
+    - name: Attendre que le master soit prêt (port 6443)
+      wait_for:
+        host: "{{ master_ip }}"
+        port: 6443
+        delay: 10
+        timeout: 300
+        state: started
+
+    - name: Joindre le Worker au Cluster
+      command: >
+        kubeadm join {{ master_ip }}:6443 
+        --token={{ token }} 
+        --discovery-token-unsafe-skip-ca-verification 
+        --cri-socket unix:///var/run/cri-dockerd.sock
+      args:
+        creates: /etc/kubernetes/kubelet.conf
