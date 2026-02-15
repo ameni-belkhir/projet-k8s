@@ -1,13 +1,14 @@
 ---
-- name: Full Master Deployment (K8s + Monitoring)
-  hosts: localhost  
-  connection: local 
+- name: Full Cluster Deployment
+  hosts: localhost
+  connection: local
   become: yes
   vars:
-    # Cette variable récupère la valeur passée par -e "master_ip_extra=..."
-    # Si rien n'est passé, elle vaut 127.0.0.1 par défaut
-    master_ip: "{{ master_ip_extra | default('127.0.0.1') }}"
-    token: "abcdef.1234567890abcdef"
+    node_role: "{{ lookup('env', 'NODE_ROLE') | default('unknown') }}"
+    master_ip: "{{ lookup('env', 'MASTER_IP') | default('127.0.0.1') }}"
+    token: "{{ lookup('env', 'TOKEN') | default('abcdef.1234567890abcdef') }}"
+
   roles:
-    - kubernetes
-    
+    - role: kubernetes
+    - role: monitoring
+      when: node_role == "master" # Le monitoring ne s'installe que sur le Master

@@ -1,14 +1,26 @@
 ---
-- name: Installer Helm (gestionnaire de paquets K8s)
-  shell: |
-    curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+- name: Installer Helm
+  shell: curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+  args:
+    creates: /usr/local/bin/helm
 
-- name: Ajouter le repo Prometheus
+- name: Ajouter le dépôt Prometheus
+  become: yes
+  become_user: ubuntu
+  kubernetes.core.helm_repository:
+    name: prometheus-community
+    repo_url: "https://prometheus-community.github.io/helm-charts"
+
+- name: Déployer la Stack Monitoring (Prometheus & Grafana)
+  become: yes
+  become_user: ubuntu
   shell: |
-    helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
     helm repo update
-
-- name: Installer Prometheus Stack (Prometheus + Grafana)
-  shell: |
-    export KUBECONFIG=/etc/kubernetes/admin.conf
-    helm install prometheus prometheus-community/kube-prometheus-stack
+    helm upgrade --install prometheus prometheus-community/kube-prometheus-stack \
+      --namespace monitoring \
+      --create-namespace \
+      --set grafana.enabled=true
+  register: helm_result
+  retries: 3
+  delay: 15
+  until: helm_result.rc == 0
