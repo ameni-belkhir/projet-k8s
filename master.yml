@@ -1,14 +1,53 @@
 ---
+# ==============================================================================
+# master.yml — Playbook principal de déploiement du cluster K8s
+# Corrections appliquées :
+#   - pod_network_cidr centralisé ici (injecté par Heat via -e)
+#   - monitoring conditionné correctement (when au niveau du rôle)
+#   - Variables Heat prioritaires sur variables d'environnement
+# ==============================================================================
+
 - name: Full Cluster Deployment
   hosts: localhost
   connection: local
   become: yes
+
   vars:
-    node_role: "{{ lookup('env', 'NODE_ROLE') | default('unknown') }}"
-    master_ip: "{{ lookup('env', 'MASTER_IP') | default('127.0.0.1') }}"
-    token: "{{ lookup('env', 'TOKEN') | default('abcdef.1234567890abcdef') }}"
+    # Ces variables sont injectées par Heat via : ansible-playbook -e "node_role=... token=... master_ip=... pod_network_cidr=..."
+    # Les lookups env() servent de fallback pour exécution manuelle hors Heat
+    node_role:        "{{ node_role        | default(lookup('env', 'NODE_ROLE'))  | default('unknown') }}"
+    master_ip:        "{{ master_ip        | default(lookup('env', 'MASTER_IP')) | default('') }}"
+    token:            "{{ token            | default(lookup('env', 'TOKEN'))      | default('abcdef.1234567890abcdef') }}"
+    # CORRECTIF CENTRAL : pod_network_cidr défini ici, injecté dans TOUS les rôles
+    # Évite la duplication entre kubernetes/tasks/main.yml et monitoring/tasks/main.yml
+    # Pour changer le CIDR : modifier uniquement ce paramètre (ou le paramètre Heat)
+    pod_network_cidr: "{{ pod_network_cidr | default('10.244.0.0/16') }}"
+
+  pre_tasks:
+    - name: Valider les variables obligatoires
+      fail:
+        msg: >
+          La variable 'node_role' est obligatoire et doit être 'master' ou 'worker'.
+          Assurez-vous que Heat injecte correctement -e "node_role=master|worker"
+      when: node_role not in ["master", "worker"]
+
+    - name: Afficher la configuration du déploiement
+      debug:
+        msg:
+          - "====================================="
+          - " Démarrage du déploiement K8s"
+          - "====================================="
+          - " Rôle         : {{ node_role }}"
+          - " Master IP    : {{ master_ip }}"
+          - " Pod CIDR     : {{ pod_network_cidr }}"
+          - "====================================="
 
   roles:
+    # Rôle 1 : Installation Kubernetes (commun master + worker)
     - role: kubernetes
+
+    # Rôle 2 : Monitoring (Calico + Prometheus/Grafana)
+    # CORRECTIF : le 'when' au niveau du rôle fonctionne correctement
+    # Ansible évalue la condition avant d'appliquer le rôle entier
     - role: monitoring
-      when: node_role == "master" # Le monitoring ne s'installe que sur le Master
+      when: node_role == "master"

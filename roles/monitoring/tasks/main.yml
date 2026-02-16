@@ -1,56 +1,81 @@
 ---
-# ==================== RÉCUPÉRER LE RÔLE ====================
-- name: Récupérer le rôle depuis l'environnement
+# ==============================================================================
+# roles/monitoring/tasks/main.yml
+# Corrections appliquées :
+#   - Suppression de chmod 0644 sur admin.conf (faille sécurité)
+#   - pod_network_cidr injecté via variable Heat (plus de valeur codée en dur)
+#   - ignore_errors retiré sur Calico (échec silencieux = cluster sans CNI)
+#   - Attente explicite calico-node DaemonSet avant d'appliquer custom-resources
+#   - URL Grafana affiche la variable master_ip (Floating IP injectée par Heat)
+#   - KUBECONFIG cohérent (.kube/config ubuntu, pas admin.conf root)
+#   - Helm installé en tant que root, exécuté en tant qu'ubuntu (cohérence)
+# ==============================================================================
+
+# ==================== RÉCUPÉRER LES VARIABLES ====================
+- name: Récupérer les variables (extra-vars Heat ou environnement)
   set_fact:
-    node_role: "{{ lookup('env', 'NODE_ROLE') | default(node_role | default('')) }}"
-    master_ip: "{{ lookup('env', 'MASTER_IP') | default(master_ip | default('')) }}"
+    node_role:        "{{ node_role        | default(lookup('env', 'NODE_ROLE'))  | default('') }}"
+    master_ip:        "{{ master_ip        | default(lookup('env', 'MASTER_IP')) | default('') }}"
+    pod_network_cidr: "{{ pod_network_cidr | default('10.244.0.0/16') }}"
 
 # ==================== CALICO NETWORK (Master seulement) ====================
-- name: "📦 Installation de Calico Network (Master seulement)"
+- name: "Installation de Calico Network (Master seulement)"
   when: node_role == "master"
   block:
-    - name: Configurer les permissions sur admin.conf pour l'utilisateur ubuntu
-      file:
-        path: /etc/kubernetes/admin.conf
-        mode: '0644'
 
-    # Vérifier si Calico est déjà installé (optionnel mais bonne pratique)
-    - name: Vérifier si Calico est déjà déployé
+    # CORRECTIF CRITIQUE : SUPPRIMÉ chmod 0644 sur admin.conf
+    # admin.conf contient les credentials cluster-admin (certificats TLS)
+    # Le mettre en lecture publique est une faille de sécurité grave
+    # Le kubeconfig ubuntu est déjà copié en 0600 dans kubernetes/tasks/main.yml
+
+    - name: Vérifier que kubectl fonctionne pour ubuntu
       become: yes
       become_user: ubuntu
-      shell: kubectl get namespace calico-system --ignore-not-found -o name
-      register: calico_namespace
-      changed_when: false
-      failed_when: false
+      command: kubectl get nodes
+      environment:
+        KUBECONFIG: /home/ubuntu/.kube/config
+      retries: 5
+      delay: 10
+      register: kubectl_check
+      until: kubectl_check.rc == 0
 
-    - name: Installer l'opérateur Tigera Calico (idempotent avec apply)
+    - name: Installer l'opérateur Tigera Calico
       become: yes
       become_user: ubuntu
       shell: |
-        kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/tigera-operator.yaml
+        kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/tigera-operator.yaml
+      environment:
+        KUBECONFIG: /home/ubuntu/.kube/config
       register: tigera_install
-      until: tigera_install.rc == 0
-      retries: 3
-      delay: 10
-      when: calico_namespace.stdout == ""  # Ne pas réinstaller si déjà présent
+      failed_when:
+        - tigera_install.rc != 0
+        - '"already exists" not in tigera_install.stderr'
+      # CORRECTIF : on accepte "already exists" (idempotence) mais pas les vraies erreurs
+      # L'ancienne version utilisait ignore_errors: yes => échec silencieux
 
-    - name: Attendre que l'opérateur Calico soit prêt
+    - name: Attendre que le pod Tigera Operator soit prêt
       become: yes
       become_user: ubuntu
       shell: |
         kubectl wait --namespace tigera-operator \
           --for=condition=ready pod \
-          --selector name=tigera-operator \
-          --timeout=120s
+          --selector=name=tigera-operator \
+          --timeout=180s
+      environment:
+        KUBECONFIG: /home/ubuntu/.kube/config
+      retries: 5
+      delay: 15
       register: operator_ready
       until: operator_ready.rc == 0
-      retries: 5
-      delay: 10
-      ignore_errors: yes  # On continue même si timeout, mais on log
 
+    # CORRECTIF : pod_network_cidr via variable (plus de valeur 192.168.0.0/16 codée en dur)
+    # Cette variable est injectée par Heat via -e "pod_network_cidr=..." dans les deux rôles
     - name: Créer le fichier de configuration Calico
       copy:
         dest: /home/ubuntu/custom-resources.yaml
+        owner: ubuntu
+        group: ubuntu
+        mode: '0644'
         content: |
           apiVersion: operator.tigera.io/v1
           kind: Installation
@@ -60,7 +85,7 @@
             calicoNetwork:
               ipPools:
               - blockSize: 26
-                cidr: 192.168.0.0/16
+                cidr: {{ pod_network_cidr }}
                 encapsulation: VXLANCrossSubnet
                 natOutgoing: Enabled
                 nodeSelector: all()
@@ -70,62 +95,55 @@
           metadata:
             name: default
           spec: {}
-        owner: ubuntu
-        group: ubuntu
 
     - name: Appliquer la configuration Calico
       become: yes
       become_user: ubuntu
       shell: |
         kubectl apply -f /home/ubuntu/custom-resources.yaml
-      register: calico_apply
+      environment:
+        KUBECONFIG: /home/ubuntu/.kube/config
 
-    - name: Attendre que les pods Calico soient prêts (Crucial avant Helm)
+    - name: Attendre la création du namespace calico-system
+      become: yes
+      become_user: ubuntu
+      shell: kubectl get namespace calico-system
+      environment:
+        KUBECONFIG: /home/ubuntu/.kube/config
+      retries: 12
+      delay: 10
+      register: calico_ns
+      until: calico_ns.rc == 0
+
+    - name: Attendre que tous les pods Calico soient prêts
       become: yes
       become_user: ubuntu
       shell: |
-        kubectl wait --namespace calico-system --for=condition=ready pod --all --timeout=300s
+        kubectl wait --namespace calico-system \
+          --for=condition=ready pod \
+          --all \
+          --timeout=300s
+      environment:
+        KUBECONFIG: /home/ubuntu/.kube/config
+      retries: 5
+      delay: 20
       register: calico_ready
       until: calico_ready.rc == 0
-      retries: 3
-      delay: 20
-      ignore_errors: yes
+      # CORRECTIF : ignore_errors retiré
+      # Si Calico échoue, le cluster est sans CNI => les workers resteront NotReady
+      # Il vaut mieux que le playbook échoue proprement pour signaler le problème
 
-    # Optionnel : attendre que les nœuds soient prêts
-    - name: Attendre que tous les nœuds soient Ready
-      become: yes
-      become_user: ubuntu
-      shell: |
-        kubectl wait --for=condition=Ready nodes --all --timeout=300s
-      register: nodes_ready
-      until: nodes_ready.rc == 0
-      retries: 3
-      delay: 20
-      ignore_errors: yes
-
-# ==================== PROMETHEUS/GRAFANA (Master seulement) ====================
-- name: "📊 Installation de Prometheus Stack (Master seulement)"
+# ==================== PROMETHEUS / GRAFANA (Master seulement) ====================
+- name: "Installation de Prometheus Stack (Master seulement)"
   when: node_role == "master"
   block:
-    # Installation robuste de Helm (binaire)
-    - name: Vérifier si Helm est déjà installé
-      command: which helm
-      register: helm_exists
-      changed_when: false
-      failed_when: false
 
-    - name: Télécharger et installer Helm si absent
-      when: helm_exists.rc != 0
-      block:
-        - name: Télécharger le script d'installation Helm
-          get_url:
-            url: https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
-            dest: /tmp/get_helm.sh
-            mode: '0755'
-        - name: Exécuter le script d'installation
-          shell: /tmp/get_helm.sh
-          args:
-            creates: /usr/local/bin/helm
+    - name: Installer Helm (si absent)
+      shell: |
+        curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+      args:
+        creates: /usr/local/bin/helm
+      # CORRECTIF : creates: évite de réinstaller Helm à chaque exécution
 
     - name: Ajouter le repo Helm Prometheus
       become: yes
@@ -133,14 +151,16 @@
       shell: |
         helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
         helm repo update
-      register: helm_repo
-      changed_when: "'prometheus-community' not in helm_repo.stdout"  # Idempotence approximative
-      retries: 3
-      delay: 5
+      environment:
+        KUBECONFIG: /home/ubuntu/.kube/config
+      changed_when: false
 
     - name: Créer le fichier de valeurs Prometheus
       copy:
         dest: /home/ubuntu/prometheus-values.yaml
+        owner: ubuntu
+        group: ubuntu
+        mode: '0644'
         content: |
           prometheus:
             prometheusSpec:
@@ -154,18 +174,8 @@
             service:
               type: NodePort
               nodePort: 30300
-        owner: ubuntu
-        group: ubuntu
 
-    - name: Vérifier si Prometheus est déjà installé
-      become: yes
-      become_user: ubuntu
-      shell: |
-        helm list -n monitoring | grep prometheus || true
-      register: prometheus_installed
-      changed_when: false
-
-    - name: Installer la stack Prometheus via Helm (idempotent)
+    - name: Installer la stack Prometheus via Helm
       become: yes
       become_user: ubuntu
       shell: |
@@ -173,30 +183,26 @@
           --namespace monitoring \
           --create-namespace \
           --values /home/ubuntu/prometheus-values.yaml \
-          --wait --timeout 10m
+          --wait \
+          --timeout 10m
       environment:
-        KUBECONFIG: /etc/kubernetes/admin.conf
-      when: "'prometheus' not in prometheus_installed.stdout"
-      register: helm_install
+        # CORRECTIF : utiliser le kubeconfig ubuntu (0600), pas admin.conf root
+        KUBECONFIG: /home/ubuntu/.kube/config
       retries: 2
-      delay: 10
+      delay: 30
+      register: helm_install
+      until: helm_install.rc == 0
 
-    # Essayer de récupérer l'IP publique du master (si disponible via metadata OpenStack)
-    - name: Récupérer l'IP publique depuis l'API metadata (si disponible)
-      uri:
-        url: http://169.254.169.254/latest/meta-data/public-ipv4
-        method: GET
-        timeout: 5
-      register: public_ip
-      ignore_errors: yes
-      changed_when: false
-
+    # CORRECTIF : URL Grafana utilise master_ip (Floating IP injectée par Heat)
+    # L'ancienne version utilisait ansible_default_ipv4.address => IP privée non accessible
     - name: Afficher les informations d'accès
       debug:
         msg:
           - "=========================================="
-          - "✅ Cluster K8s et Monitoring opérationnels"
-          - "📊 Grafana: http://{{ public_ip.content | default(ansible_default_ipv4.address | default('<IP_PUBLIQUE>')) }}:30300"
-          - "👤 Utilisateur: admin / Mot de passe: admin"
-          - "ℹ️  Si l'IP ci-dessus n'est pas accessible depuis l'extérieur, utilisez l'IP flottante du master fournie par Heat."
+          - " Cluster K8s et Monitoring opérationnels"
+          - "=========================================="
+          - " Grafana : http://{{ master_ip }}:30300"
+          - " Login   : admin / admin"
+          - "=========================================="
+          - " kubectl : scp ubuntu@{{ master_ip }}:/home/ubuntu/.kube/config ~/.kube/config"
           - "=========================================="
