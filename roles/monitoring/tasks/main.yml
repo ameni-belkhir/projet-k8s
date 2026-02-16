@@ -14,16 +14,25 @@
         path: /etc/kubernetes/admin.conf
         mode: '0644'
 
-    - name: Installer l'opérateur Tigera Calico
+    # Vérifier si Calico est déjà installé (optionnel mais bonne pratique)
+    - name: Vérifier si Calico est déjà déployé
+      become: yes
+      become_user: ubuntu
+      shell: kubectl get namespace calico-system --ignore-not-found -o name
+      register: calico_namespace
+      changed_when: false
+      failed_when: false
+
+    - name: Installer l'opérateur Tigera Calico (idempotent avec apply)
       become: yes
       become_user: ubuntu
       shell: |
-        kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/tigera-operator.yaml
+        kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/tigera-operator.yaml
       register: tigera_install
       until: tigera_install.rc == 0
       retries: 3
       delay: 10
-      ignore_errors: yes
+      when: calico_namespace.stdout == ""  # Ne pas réinstaller si déjà présent
 
     - name: Attendre que l'opérateur Calico soit prêt
       become: yes
@@ -37,7 +46,7 @@
       until: operator_ready.rc == 0
       retries: 5
       delay: 10
-      ignore_errors: yes
+      ignore_errors: yes  # On continue même si timeout, mais on log
 
     - name: Créer le fichier de configuration Calico
       copy:
@@ -69,6 +78,7 @@
       become_user: ubuntu
       shell: |
         kubectl apply -f /home/ubuntu/custom-resources.yaml
+      register: calico_apply
 
     - name: Attendre que les pods Calico soient prêts (Crucial avant Helm)
       become: yes
@@ -81,16 +91,41 @@
       delay: 20
       ignore_errors: yes
 
+    # Optionnel : attendre que les nœuds soient prêts
+    - name: Attendre que tous les nœuds soient Ready
+      become: yes
+      become_user: ubuntu
+      shell: |
+        kubectl wait --for=condition=Ready nodes --all --timeout=300s
+      register: nodes_ready
+      until: nodes_ready.rc == 0
+      retries: 3
+      delay: 20
+      ignore_errors: yes
+
 # ==================== PROMETHEUS/GRAFANA (Master seulement) ====================
 - name: "📊 Installation de Prometheus Stack (Master seulement)"
   when: node_role == "master"
   block:
-    - name: Installer Helm
-      shell: |
-        if ! command -v helm &> /dev/null; then 
-          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-        fi
+    # Installation robuste de Helm (binaire)
+    - name: Vérifier si Helm est déjà installé
+      command: which helm
+      register: helm_exists
       changed_when: false
+      failed_when: false
+
+    - name: Télécharger et installer Helm si absent
+      when: helm_exists.rc != 0
+      block:
+        - name: Télécharger le script d'installation Helm
+          get_url:
+            url: https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+            dest: /tmp/get_helm.sh
+            mode: '0755'
+        - name: Exécuter le script d'installation
+          shell: /tmp/get_helm.sh
+          args:
+            creates: /usr/local/bin/helm
 
     - name: Ajouter le repo Helm Prometheus
       become: yes
@@ -98,6 +133,10 @@
       shell: |
         helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
         helm repo update
+      register: helm_repo
+      changed_when: "'prometheus-community' not in helm_repo.stdout"  # Idempotence approximative
+      retries: 3
+      delay: 5
 
     - name: Créer le fichier de valeurs Prometheus
       copy:
@@ -118,7 +157,15 @@
         owner: ubuntu
         group: ubuntu
 
-    - name: Installer la stack Prometheus via Helm
+    - name: Vérifier si Prometheus est déjà installé
+      become: yes
+      become_user: ubuntu
+      shell: |
+        helm list -n monitoring | grep prometheus || true
+      register: prometheus_installed
+      changed_when: false
+
+    - name: Installer la stack Prometheus via Helm (idempotent)
       become: yes
       become_user: ubuntu
       shell: |
@@ -129,12 +176,27 @@
           --wait --timeout 10m
       environment:
         KUBECONFIG: /etc/kubernetes/admin.conf
+      when: "'prometheus' not in prometheus_installed.stdout"
+      register: helm_install
+      retries: 2
+      delay: 10
+
+    # Essayer de récupérer l'IP publique du master (si disponible via metadata OpenStack)
+    - name: Récupérer l'IP publique depuis l'API metadata (si disponible)
+      uri:
+        url: http://169.254.169.254/latest/meta-data/public-ipv4
+        method: GET
+        timeout: 5
+      register: public_ip
+      ignore_errors: yes
+      changed_when: false
 
     - name: Afficher les informations d'accès
       debug:
         msg:
           - "=========================================="
           - "✅ Cluster K8s et Monitoring opérationnels"
-          - "📊 Grafana: http://{{ ansible_default_ipv4.address }}:30300"
-          - "👤 User: admin / Pass: admin"
+          - "📊 Grafana: http://{{ public_ip.content | default(ansible_default_ipv4.address | default('<IP_PUBLIQUE>')) }}:30300"
+          - "👤 Utilisateur: admin / Mot de passe: admin"
+          - "ℹ️  Si l'IP ci-dessus n'est pas accessible depuis l'extérieur, utilisez l'IP flottante du master fournie par Heat."
           - "=========================================="

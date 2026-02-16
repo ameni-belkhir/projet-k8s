@@ -5,10 +5,22 @@
     node_role: "{{ lookup('env', 'NODE_ROLE') | default(node_role | default('')) }}"
     master_ip: "{{ lookup('env', 'MASTER_IP') | default(master_ip | default('')) }}"
     token: "{{ lookup('env', 'TOKEN') | default('abcdef.1234567890abcdef') }}"
+    # Variables pour la version des composants (rend la mise à jour plus facile)
+    k8s_version: "v1.29"
+    cri_dockerd_version: "0.3.11"
 
 - name: Afficher la configuration
   debug:
     msg: "Configuration - Rôle: {{ node_role }}, Master IP: {{ master_ip }}"
+
+# ==================== VALIDATION ====================
+- name: Valider le format du token (pour le master)
+  assert:
+    that:
+      - token is match('[a-z0-9]{6}\.[a-z0-9]{16}')
+    fail_msg: "Le token doit être au format 'xxxxxx.xxxxxxxxxxxxxxxx' (6 caractères, point, 16 caractères)."
+  when: node_role == "master"
+  ignore_errors: yes  # Si le token est invalide, on continue mais on prévient
 
 # ==================== TÂCHES COMMUNES (Master & Worker) ====================
 - name: "🔧 TÂCHES COMMUNES - Exécution sur {{ node_role }}"
@@ -23,6 +35,7 @@
         dpkg --configure -a
         apt-get install -f -y
       ignore_errors: yes
+      changed_when: false
 
     # 2. Préparation du Système (Swap, Modules, Réseau)
     - name: Supprimer les anciens dépôts Kubernetes
@@ -38,6 +51,7 @@
         swapoff -a
         sed -i '/\sswap\s/ s/^\(.*\)$/#\1/g' /etc/fstab
       when: ansible_swaptotal_mb > 0
+      changed_when: false
 
     - name: Charger les modules noyau
       modprobe:
@@ -62,16 +76,39 @@
         state: directory
         mode: '0755'
 
-    - name: Configurer le dépôt Kubernetes (v1.29)
-      shell: |
-        curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg --yes
-        echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /" > /etc/apt/sources.list.d/kubernetes.list
+    - name: Ajouter la clé GPG et le dépôt Kubernetes (v{{ k8s_version }})
+      block:
+        - name: Télécharger la clé GPG
+          get_url:
+            url: "https://pkgs.k8s.io/core:/stable:/{{ k8s_version }}/deb/Release.key"
+            dest: /tmp/kubernetes-apt-keyring.key
+            mode: '0644'
+        - name: Déplacer la clé décompressée
+          shell: |
+            gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg < /tmp/kubernetes-apt-keyring.key
+          args:
+            creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        - name: Ajouter le dépôt
+          copy:
+            dest: /etc/apt/sources.list.d/kubernetes.list
+            content: |
+              deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/{{ k8s_version }}/deb/ /
+          register: repo_added
+
+    - name: Mettre à jour le cache APT si le dépôt a changé
+      apt:
+        update_cache: yes
+      when: repo_added.changed
 
     - name: Installer Docker et les outils K8s
       apt:
-        name: [docker.io, kubelet, kubeadm, kubectl]
+        name:
+          - docker.io
+          - kubelet
+          - kubeadm
+          - kubectl
         state: present
-        update_cache: yes
+        update_cache: no  # déjà fait si nécessaire
 
     - name: Configurer Docker (Cgroup systemd)
       copy:
@@ -82,48 +119,148 @@
             "log-driver": "json-file",
             "storage-driver": "overlay2"
           }
+      notify: Redémarrer docker
 
+    # ----------------------------------------------------------------------
+    # Installation robuste de cri-dockerd (gère différentes releases Ubuntu)
+    # ----------------------------------------------------------------------
     - name: Installer et démarrer cri-dockerd
       block:
-        - name: Supprimer tout ancien fichier corrompu
-          file:
-            path: /tmp/cri-dockerd.deb
-            state: absent
+        # Vérifier si cri-dockerd est déjà installé
+        - name: Vérifier si cri-dockerd est déjà présent
+          command: dpkg-query -W -f='${Status}' cri-dockerd
+          register: cri_dockerd_check
+          failed_when: false
+          changed_when: false
 
-        - name: Télécharger cri-dockerd (v0.3.11)
-          get_url:
-            url: "https://github.com/Mirantis/cri-dockerd/releases/download/v0.3.11/cri-dockerd_0.3.11.3-0.ubuntu-jammy_amd64.deb"
-            dest: /tmp/cri-dockerd.deb
-            mode: '0644'
-            force: yes  # Force le retéléchargement pour garantir l'intégrité
-            timeout: 60
+        - name: Définir un flag pour l'installation
+          set_fact:
+            cri_dockerd_installed: "{{ cri_dockerd_check.rc == 0 and 'installed' in cri_dockerd_check.stdout }}"
 
-        - name: Installer le paquet .deb
-          apt:
-            deb: /tmp/cri-dockerd.deb
-            state: present
+        # Si non installé, déterminer la release Ubuntu
+        - name: Obtenir la release Ubuntu (ex: focal, jammy, noble)
+          set_fact:
+            ubuntu_codename: "{{ ansible_distribution_release }}"
+          when: not cri_dockerd_installed
 
-        - name: Redémarrer les services
+        - name: Mapper le nom de la release pour l'URL (releases supportées par les paquets cri-dockerd)
+          set_fact:
+            supported_releases:
+              focal: "focal"      # 20.04
+              jammy: "jammy"      # 22.04
+              noble: "noble"      # 24.04
+            release_for_url: "{{ supported_releases[ubuntu_codename] | default('') }}"
+          when: not cri_dockerd_installed
+
+        # Tenter l'installation via .deb si la release est supportée
+        - name: Installer cri-dockerd via .deb (release supportée)
+          when:
+            - not cri_dockerd_installed
+            - release_for_url != ""
+          block:
+            - name: Supprimer tout ancien fichier corrompu
+              file:
+                path: /tmp/cri-dockerd.deb
+                state: absent
+
+            - name: Télécharger cri-dockerd .deb pour {{ ubuntu_codename }}
+              get_url:
+                url: "https://github.com/Mirantis/cri-dockerd/releases/download/v{{ cri_dockerd_version }}/cri-dockerd_{{ cri_dockerd_version }}.3-0.ubuntu-{{ release_for_url }}_amd64.deb"
+                dest: /tmp/cri-dockerd.deb
+                mode: '0644'
+                timeout: 60
+              register: download_result
+              until: download_result is success
+              retries: 3
+              delay: 5
+
+            - name: Installer le paquet .deb
+              apt:
+                deb: /tmp/cri-dockerd.deb
+                state: present
+
+        # Fallback : installation via binaire précompilé (si .deb non disponible)
+        - name: Installer cri-dockerd via binaire (fallback)
+          when:
+            - not cri_dockerd_installed
+            - release_for_url == ""
+          block:
+            - name: Télécharger l'archive binaire
+              get_url:
+                url: "https://github.com/Mirantis/cri-dockerd/releases/download/v{{ cri_dockerd_version }}/cri-dockerd-{{ cri_dockerd_version }}.amd64.tgz"
+                dest: /tmp/cri-dockerd.tgz
+                mode: '0644'
+              register: bin_download
+
+            - name: Extraire et installer le binaire
+              shell: |
+                tar -xzf /tmp/cri-dockerd.tgz -C /tmp/
+                install -o root -g root -m 0755 /tmp/cri-dockerd/cri-dockerd /usr/local/bin/cri-dockerd
+              args:
+                creates: /usr/local/bin/cri-dockerd
+
+            - name: Créer le fichier service systemd pour cri-dockerd
+              copy:
+                dest: /etc/systemd/system/cri-docker.service
+                content: |
+                  [Unit]
+                  Description=CRI Interface for Docker Application Container Engine
+                  Documentation=https://docs.mirantis.com
+                  After=docker.service
+                  Wants=docker.service
+
+                  [Service]
+                  Type=notify
+                  ExecStart=/usr/local/bin/cri-dockerd --container-runtime-endpoint fd://
+                  Restart=always
+                  RestartSec=10s
+
+                  [Install]
+                  WantedBy=multi-user.target
+              when: bin_download is changed
+
+            - name: Activer et démarrer cri-dockerd
+              systemd:
+                name: cri-docker
+                state: started
+                enabled: yes
+                daemon_reload: yes
+
+        # Redémarrer les services si nécessaire (commun aux deux méthodes)
+        - name: Redémarrer les services (si installation/modification)
           systemd:
             name: "{{ item }}"
             state: restarted
             enabled: yes
             daemon_reload: yes
-          loop: [docker, cri-docker]
+          loop:
+            - docker
+            - cri-docker
+          when: not cri_dockerd_installed  # Ne redémarrer que si on vient d'installer
+
   when: node_role in ["master", "worker"]
 
 # ==================== TÂCHES SPÉCIFIQUES AU MASTER ====================
 - name: "👑 TÂCHES MASTER - Initialisation du cluster"
   when: node_role == "master"
   block:
-    - name: Initialiser le Master Kubernetes
+    - name: Vérifier que le cluster n'est pas déjà initialisé
+      stat:
+        path: /etc/kubernetes/admin.conf
+      register: k8s_initialized
+
+    - name: Initialiser le Master Kubernetes (avec vérifications ciblées)
       command: >
-        kubeadm init --pod-network-cidr=192.168.0.0/16 
-        --token={{ token }} 
-        --cri-socket unix:///var/run/cri-dockerd.sock 
-        --ignore-preflight-errors=all
+        kubeadm init --pod-network-cidr=192.168.0.0/16
+        --token={{ token }}
+        --cri-socket unix:///var/run/cri-dockerd.sock
+        --ignore-preflight-errors=Swap,FileContent--proc-sys-net-bridge-bridge-nf-call-iptables,FileContent--proc-sys-net-ipv4-ip_forward
       args:
         creates: /etc/kubernetes/admin.conf
+      when: not k8s_initialized.stat.exists
+      register: kubeadm_init
+      # Si la commande échoue, afficher la sortie
+      failed_when: kubeadm_init.rc != 0 and "FileExists" not in kubeadm_init.stderr
 
     - name: Configurer Kubeconfig pour l'utilisateur ubuntu
       block:
@@ -133,6 +270,8 @@
             state: directory
             owner: ubuntu
             group: ubuntu
+            mode: '0755'
+
         - name: Copier admin.conf
           copy:
             src: /etc/kubernetes/admin.conf
@@ -141,6 +280,7 @@
             owner: ubuntu
             group: ubuntu
             mode: '0600'
+      when: kubeadm_init is changed or not k8s_initialized.stat.exists
 
 # ==================== TÂCHES SPÉCIFIQUES AU WORKER ====================
 - name: "🔧 TÂCHES WORKER - Join au cluster"
@@ -159,11 +299,25 @@
         timeout: 300
         state: started
 
+    - name: Vérifier si le worker a déjà rejoint
+      stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: kubelet_conf
+
     - name: Joindre le Worker au Cluster
       command: >
-        kubeadm join {{ master_ip }}:6443 
-        --token={{ token }} 
-        --discovery-token-unsafe-skip-ca-verification 
+        kubeadm join {{ master_ip }}:6443
+        --token={{ token }}
+        --discovery-token-unsafe-skip-ca-verification
         --cri-socket unix:///var/run/cri-dockerd.sock
       args:
         creates: /etc/kubernetes/kubelet.conf
+      when: not kubelet_conf.stat.exists
+
+# ==================== HANDLERS ====================
+handlers:
+  - name: Redémarrer docker
+    systemd:
+      name: docker
+      state: restarted
+      daemon_reload: yes
