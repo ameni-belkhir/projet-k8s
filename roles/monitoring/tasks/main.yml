@@ -1,9 +1,14 @@
-- name: Wait for all pods in kube-system
+- name: Wait for CoreDNS
   become_user: ubuntu
-  shell: |
-    until kubectl get pods -n kube-system | grep -v Running | grep -v Completed; do
-      sleep 15
-    done
+  command: kubectl wait --for=condition=Ready pods -n kube-system -l k8s-app=kube-dns --timeout=600s
+
+- name: Wait for Calico nodes
+  become_user: ubuntu
+  command: kubectl wait --for=condition=Ready pods -n kube-system -l k8s-app=calico-node --timeout=600s
+
+- name: Wait for kube-proxy
+  become_user: ubuntu
+  command: kubectl wait --for=condition=Ready pods -n kube-system -l k8s-app=kube-proxy --timeout=600s
 - name: Install Helm
   shell: |
     if ! command -v helm; then
