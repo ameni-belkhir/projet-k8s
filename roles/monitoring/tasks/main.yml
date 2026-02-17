@@ -1,19 +1,36 @@
-- name: Wait for CoreDNS
-  become_user: ubuntu
-  command: kubectl wait --for=condition=Ready pods -n kube-system -l k8s-app=coredns --timeout=600s
+# monitoring/tasks/main.yml
 
-- name: Wait for Calico nodes
+- name: Wait for CoreDNS to be available
   become_user: ubuntu
-  command: kubectl wait --for=condition=Ready pods -n calico-system -l k8s-app=calico-node --timeout=600s
+  command: kubectl wait --for=condition=Available deployment/coredns -n kube-system --timeout=600s
+  retries: 3
+  delay: 30
+  register: coredns_wait
+  until: coredns_wait is succeeded
 
-- name: Wait for kube-proxy
+- name: Wait for Calico node daemonset to be available
   become_user: ubuntu
-  command: kubectl wait --for=condition=Ready pods -n kube-system -l k8s-app=kube-proxy --timeout=600s
+  command: kubectl wait --for=condition=Available daemonset/calico-node -n kube-system --timeout=600s
+  retries: 3
+  delay: 30
+  register: calico_wait
+  until: calico_wait is succeeded
+
+- name: Wait for kube-proxy daemonset to be available
+  become_user: ubuntu
+  command: kubectl wait --for=condition=Available daemonset/kube-proxy -n kube-system --timeout=600s
+  retries: 3
+  delay: 30
+  register: kubeproxy_wait
+  until: kubeproxy_wait is succeeded
+
 - name: Install Helm
   shell: |
     if ! command -v helm; then
       curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
     fi
+  args:
+    creates: /usr/local/bin/helm
 
 - name: Deploy Prometheus stack
   become_user: ubuntu
@@ -22,4 +39,6 @@
     helm repo update
     helm upgrade --install prometheus prometheus-community/kube-prometheus-stack \
       --namespace monitoring \
-      --create-namespace
+      --create-namespace \
+      --wait \
+      --timeout 10m
