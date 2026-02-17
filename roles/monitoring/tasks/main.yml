@@ -1,3 +1,9 @@
+- name: Wait for all pods in kube-system
+  become_user: ubuntu
+  shell: |
+    until kubectl get pods -n kube-system | grep -v Running | grep -v Completed; do
+      sleep 15
+    done
 - name: Install Helm
   shell: |
     if ! command -v helm; then
