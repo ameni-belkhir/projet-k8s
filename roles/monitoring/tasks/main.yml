@@ -1,47 +1,47 @@
-# monitoring/tasks/main.yml - CORRECTED VERSION
+# monitoring/tasks/main.yml - FINAL FIXED VERSION
 
 - name: Wait for CoreDNS deployment to be Available
   become_user: ubuntu
   command: kubectl wait --for=condition=Available deployment/coredns -n kube-system --timeout=600s
-  retries: 6
-  delay: 30
+  retries: 10
+  delay: 20
   register: coredns_wait
-  until: coredns_wait is succeeded
+  until: coredns_wait.rc == 0
 
 - name: Wait for Calico node daemonset to be Available
   become_user: ubuntu
   command: kubectl wait --for=condition=Available daemonset/calico-node -n kube-system --timeout=600s
-  retries: 6
-  delay: 30
+  retries: 10
+  delay: 20
   register: calico_wait
-  until: calico_wait is succeeded
+  until: calico_wait.rc == 0
 
 - name: Wait for kube-proxy daemonset to be Available
   become_user: ubuntu
   command: kubectl wait --for=condition=Available daemonset/kube-proxy -n kube-system --timeout=600s
-  retries: 6
-  delay: 30
+  retries: 10
+  delay: 20
   register: kubeproxy_wait
-  until: kubeproxy_wait is succeeded
+  until: kubeproxy_wait.rc == 0
 
-- name: Install Helm (if not present)
-  shell: |
-    if ! command -v helm >/dev/null 2>&1; then
-      curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-    fi
-  args:
-    creates: /usr/local/bin/helm
-
-- name: Deploy kube-prometheus-stack
+- name: Add Prometheus community Helm repo
   become_user: ubuntu
-  shell: |
-    helm repo add prometheus-community https://prometheus-community.github.io/helm-charts --force-update
-    helm repo update
-    helm upgrade --install prometheus prometheus-community/kube-prometheus-stack \
-      --namespace monitoring \
-      --create-namespace \
-      --wait \
-      --timeout 15m0s \
-      --set grafana.adminPassword=prom-operator
-  register: helm_deploy
-  changed_when: helm_deploy.rc == 0
+  kubernetes.core.helm_repository:
+    name: prometheus-community
+    repo_url: https://prometheus-community.github.io/helm-charts
+
+- name: Deploy or upgrade kube-prometheus-stack
+  become_user: ubuntu
+  kubernetes.core.helm:
+    name: prometheus
+    chart_ref: prometheus-community/kube-prometheus-stack
+    release_namespace: monitoring
+    create_namespace: true
+    wait: true
+    timeout: 15m0s
+    values:
+      grafana:
+        adminPassword: prom-operator  # Change this to something secure if desired
+      prometheus:
+        prometheusSpec:
+          serviceMonitorSelectorNilUsesHelmValues: false
