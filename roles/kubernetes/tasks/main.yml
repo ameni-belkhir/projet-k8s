@@ -108,7 +108,6 @@
       - kubeadm={{ k8s_version }}.*
       - kubectl={{ k8s_version }}.*
     state: present
-    allow_downgrade: yes
   retries: 3
   delay: 10
 
