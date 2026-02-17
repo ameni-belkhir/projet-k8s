@@ -1,20 +1,35 @@
-- name: Full Cluster Deployment
+---
+- name: Full Kubernetes Cluster Deployment with Enhanced Error Handling
   hosts: localhost
   connection: local
   become: yes
-
   vars:
-    node_role: "{{ node_role }}"
-    master_ip: "{{ master_ip }}"
-    token: "{{ token }}"
-    pod_network_cidr: "192.168.0.0/16"
-
+    node_role: "{{ node_role | default('unknown') }}"
+    master_ip: "{{ master_ip | default('') }}"
+    token: "{{ token | default('abcdef.1234567890abcdef') }}"
+    pod_network_cidr: "{{ pod_network_cidr | default('192.168.0.0/16') }}"
+    k8s_version: "1.29"
+    calico_version: "v3.27.0"
+    
   pre_tasks:
-    - name: Validate node_role
+    - name: Validate required variables
       fail:
-        msg: "node_role must be master or worker"
+        msg: "Variable 'node_role' must be 'master' or 'worker'."
       when: node_role not in ["master", "worker"]
-
+    
+    - name: Validate master_ip for worker nodes
+      fail:
+        msg: "Variable 'master_ip' is required for worker nodes."
+      when: node_role == "worker" and (master_ip is not defined or master_ip == "")
+    
+    - name: Display deployment info
+      debug:
+        msg:
+          - "Node Role: {{ node_role }}"
+          - "Master IP: {{ master_ip }}"
+          - "Pod Network CIDR: {{ pod_network_cidr }}"
+          - "Kubernetes Version: {{ k8s_version }}"
+  
   roles:
     - role: kubernetes
     - role: monitoring
