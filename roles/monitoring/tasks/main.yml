@@ -1,10 +1,10 @@
 - name: Wait for CoreDNS
   become_user: ubuntu
-  command: kubectl wait --for=condition=Ready pods -n kube-system -l k8s-app=kube-dns --timeout=600s
+  command: kubectl wait --for=condition=Ready pods -n kube-system -l k8s-app=coredns --timeout=600s
 
 - name: Wait for Calico nodes
   become_user: ubuntu
-  command: kubectl wait --for=condition=Ready pods -n kube-system -l k8s-app=calico-node --timeout=600s
+  command: kubectl wait --for=condition=Ready pods -n calico-system -l k8s-app=calico-node --timeout=600s
 
 - name: Wait for kube-proxy
   become_user: ubuntu
