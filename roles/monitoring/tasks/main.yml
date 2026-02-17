@@ -1,26 +1,26 @@
-# monitoring/tasks/main.yml - WORKING FIX FOR YOUR SETUP
+# monitoring/tasks/main.yml - CORRECTED FOR YOUR EXACT SETUP
 
-- name: Wait for CoreDNS pods to be Ready (using correct label kube-dns)
+- name: Wait for CoreDNS pods to be Ready (correct label is kube-dns)
   become_user: ubuntu
   command: kubectl wait --for=condition=Ready pods -n kube-system -l k8s-app=kube-dns --timeout=600s
-  retries: 10
-  delay: 20
+  retries: 15
+  delay: 15
   register: coredns_wait
   until: coredns_wait.rc == 0
 
 - name: Wait for Calico node pods to be Ready
   become_user: ubuntu
   command: kubectl wait --for=condition=Ready pods -n kube-system -l k8s-app=calico-node --timeout=600s
-  retries: 10
-  delay: 20
+  retries: 15
+  delay: 15
   register: calico_wait
   until: calico_wait.rc == 0
 
 - name: Wait for kube-proxy pods to be Ready
   become_user: ubuntu
   command: kubectl wait --for=condition=Ready pods -n kube-system -l k8s-app=kube-proxy --timeout=600s
-  retries: 10
-  delay: 20
+  retries: 15
+  delay: 15
   register: kubeproxy_wait
   until: kubeproxy_wait.rc == 0
 
@@ -32,10 +32,8 @@
   args:
     creates: /usr/local/bin/helm
 
-- name: Add Prometheus Helm repo
-  shell: |
-    helm repo add prometheus-community https://prometheus-community.github.io/helm-charts --force-update
-    helm repo update
+- name: Update Helm repositories
+  shell: helm repo update
 
 - name: Deploy kube-prometheus-stack
   become_user: ubuntu
@@ -47,4 +45,6 @@
       --timeout 15m0s \
       --set grafana.adminPassword=prom-operator
   register: helm_deploy
-  changed_when: helm_deploy.rc == 0
+  retries: 3
+  delay: 30
+  until: helm_deploy.rc == 0
