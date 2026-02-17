@@ -1,27 +1,28 @@
----
-- name: Attendre que le verrou APT soit libéré
+# ---------- SYSTEM PREP (ALL NODES) ----------
+
+- name: Wait for APT lock
   shell: while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do sleep 5; done;
   changed_when: false
 
-- name: Réparer les installations interrompues
+- name: Fix interrupted installs
   shell: |
     dpkg --configure -a
     apt-get install -f -y
   ignore_errors: yes
 
-- name: Désactiver le Swap
+- name: Disable swap
   shell: |
     swapoff -a
-    sed -i '/\sswap\s/ s/^\(.*\)$/#\1/g' /etc/fstab
+    sed -i '/\sswap\s/ s/^/#/' /etc/fstab
   when: ansible_swaptotal_mb > 0
 
-- name: Charger les modules noyau
+- name: Load kernel modules
   modprobe:
     name: "{{ item }}"
     state: present
   loop: [overlay, br_netfilter]
 
-- name: Configurer le sysctl
+- name: Sysctl config
   sysctl:
     name: "{{ item.key }}"
     value: "{{ item.value }}"
@@ -31,83 +32,83 @@
     - { key: 'net.bridge.bridge-nf-call-iptables', value: '1' }
     - { key: 'net.ipv4.ip_forward', value: '1' }
 
-- name: Configurer le dépôt Kubernetes (v1.29)
+# ---------- INSTALL PACKAGES ----------
+
+- name: Kubernetes repo
   shell: |
     mkdir -p /etc/apt/keyrings
-    curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg --yes
-    echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /" > /etc/apt/sources.list.d/kubernetes.list
+    curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key | \
+      gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg --yes
+    echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] \
+      https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /" \
+      > /etc/apt/sources.list.d/kubernetes.list
 
-- name: Installer Docker et K8s
+- name: Install packages
   apt:
-    name: [docker.io, kubelet, kubeadm, kubectl]
+    name:
+      - containerd
+      - kubelet
+      - kubeadm
+      - kubectl
     state: present
     update_cache: yes
 
-- name: Configurer Docker (Cgroup systemd)
-  copy:
-    dest: /etc/docker/daemon.json
-    content: |
-      {
-        "exec-opts": ["native.cgroupdriver=systemd"],
-        "log-driver": "json-file",
-        "storage-driver": "overlay2"
-      }
+- name: Configure containerd
+  shell: |
+    containerd config default > /etc/containerd/config.toml
+    sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
 
-- name: Installer cri-dockerd
-  block:
-    - get_url:
-        url: https://github.com/Mirantis/cri-dockerd/releases/download/v0.3.10/cri-dockerd_0.3.10.3-0.ubuntu-jammy_amd64.deb
-        dest: /tmp/cri-dockerd.deb
-    - apt:
-        deb: /tmp/cri-dockerd.deb
-        state: present
-    - systemd:
-        name: "{{ item }}"
-        state: restarted
-        enabled: yes
-        daemon_reload: yes
-      loop: [docker, cri-docker]
+- name: Restart containerd
+  systemd:
+    name: containerd
+    state: restarted
+    enabled: yes
 
-# --- SECTION MASTER ---
-- name: Initialiser le Master
-  command: >
-    kubeadm init --pod-network-cidr={{ pod_network_cidr }} 
-    --token={{ token }} 
-    --cri-socket unix:///var/run/cri-dockerd.sock 
-    --ignore-preflight-errors=all
-  when: node_role == 'master'
+# ---------- MASTER ONLY ----------
+
+- name: Init cluster
+  command: kubeadm init --pod-network-cidr={{ pod_network_cidr }}
+  when: node_role == "master"
   args:
     creates: /etc/kubernetes/admin.conf
 
-- name: Configurer kubectl pour ubuntu
+- name: Setup kubeconfig
   file:
     path: /home/ubuntu/.kube
     state: directory
     owner: ubuntu
     group: ubuntu
-  when: node_role == 'master'
+  when: node_role == "master"
 
-- name: Copier le config kube
+- name: Copy kubeconfig
   copy:
     src: /etc/kubernetes/admin.conf
     dest: /home/ubuntu/.kube/config
     remote_src: yes
     owner: ubuntu
     group: ubuntu
-  when: node_role == 'master'
+  when: node_role == "master"
 
-- name: Installer le réseau Calico
-  become: false
-  command: kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/calico.yaml
-  when: node_role == 'master'
+- name: Install Calico operator
+  become_user: ubuntu
+  command: kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/tigera-operator.yaml
+  when: node_role == "master"
 
-# --- SECTION WORKER ---
-- name: Joindre le Cluster
-  command: >
-    kubeadm join {{ master_ip }}:6443 
-    --token={{ token }} 
-    --discovery-token-unsafe-skip-ca-verification 
-    --cri-socket unix:///var/run/cri-dockerd.sock
-  when: node_role == 'worker'
+- name: Install Calico resources
+  become_user: ubuntu
+  command: kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/custom-resources.yaml
+  when: node_role == "master"
+
+- name: Wait for nodes Ready
+  become_user: ubuntu
+  shell: |
+    until kubectl get nodes | grep -v NotReady; do sleep 10; done
+  when: node_role == "master"
+
+# ---------- WORKER ONLY ----------
+
+- name: Join cluster
+  command: kubeadm join {{ master_ip }}:6443 --token {{ token }} --discovery-token-unsafe-skip-ca-verification
+  when: node_role == "worker"
   args:
     creates: /etc/kubernetes/kubelet.conf
