@@ -10,7 +10,8 @@
     pod_network_cidr: "{{ pod_network_cidr | default('192.168.0.0/16') }}"
     k8s_version: "1.29"
     calico_version: "v3.27.0"
-    
+    use_cinder: "{{ use_cinder | default(false) }}"
+    storage_path: "{{ storage_path | default('/mnt/k8s-storage') }}"
   pre_tasks:
     - name: Validate required variables
       fail:
