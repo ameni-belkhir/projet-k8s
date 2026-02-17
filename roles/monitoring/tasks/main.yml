@@ -1,39 +1,315 @@
-# monitoring/tasks/main.yml - THIS VERSION USES DEPLOYMENT/DAEMONSET CONDITIONS (NO LABELS, GUARANTEED TO WORK)
+---
+# Monitoring Role - Main Tasks
+# Deploys Prometheus, Grafana, and full monitoring stack on master node
 
-- name: Wait for CoreDNS deployment to be Available
+- name: Wait for all cluster nodes to be ready
+  become: yes
   become_user: ubuntu
-  command: kubectl wait --for=condition=Available deployment/coredns -n kube-system --timeout=600s
-  ignore_errors: yes  # Temporary to allow progress if somehow stuck; remove later
+  shell: |
+    kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' | grep -c "True" || echo "0"
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  register: ready_nodes
+  until: ready_nodes.stdout|int >= 1
+  retries: 30
+  delay: 20
+  changed_when: false
 
-- name: Wait for Calico node daemonset to be Available
+- name: Wait for CoreDNS pods to be ready
+  become: yes
   become_user: ubuntu
-  command: kubectl wait --for=condition=Available daemonset/calico-node -n kube-system --timeout=600s
+  shell: |
+    kubectl wait --for=condition=Ready pods -l k8s-app=kube-dns -n kube-system --timeout=300s
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  retries: 3
+  delay: 20
   ignore_errors: yes
 
-- name: Wait for kube-proxy daemonset to be Available
+- name: Check if Helm is installed
+  shell: command -v helm
+  register: helm_check
+  changed_when: false
+  failed_when: false
+
+- name: Download and install Helm
+  shell: |
+    curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+  when: helm_check.rc != 0
+  retries: 3
+  delay: 10
+
+- name: Verify Helm installation
+  shell: helm version --short
+  register: helm_version
+  changed_when: false
+
+- name: Display Helm version
+  debug:
+    var: helm_version.stdout
+
+- name: Add Prometheus Community Helm repository
+  become: yes
   become_user: ubuntu
-  command: kubectl wait --for=condition=Available daemonset/kube-proxy -n kube-system --timeout=600s
-  ignore_errors: yes
-
-- name: Install Helm if not present
   shell: |
-    if ! command -v helm >/dev/null 2>&1; then
-      curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-    fi
-  args:
-    creates: /usr/local/bin/helm
+    helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  changed_when: false
+  retries: 3
+  delay: 10
 
-- name: Add Prometheus Helm repo (if not already)
+- name: Add Grafana Helm repository
+  become: yes
+  become_user: ubuntu
   shell: |
-    helm repo add prometheus-community https://prometheus-community.github.io/helm-charts || true
+    helm repo add grafana https://grafana.github.io/helm-charts
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  changed_when: false
+  retries: 3
+  delay: 10
+
+- name: Update Helm repositories
+  become: yes
+  become_user: ubuntu
+  shell: |
     helm repo update
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  changed_when: false
+  retries: 3
+  delay: 10
 
-- name: Deploy kube-prometheus-stack
+- name: Create monitoring namespace
+  become: yes
+  become_user: ubuntu
+  shell: |
+    kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  changed_when: false
+
+- name: Create custom values file for Prometheus stack
+  copy:
+    dest: /tmp/prometheus-values.yaml
+    content: |
+      # Prometheus Operator Configuration
+      prometheusOperator:
+        resources:
+          limits:
+            cpu: 200m
+            memory: 256Mi
+          requests:
+            cpu: 100m
+            memory: 128Mi
+      
+      # Prometheus Configuration
+      prometheus:
+        prometheusSpec:
+          retention: 7d
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: 500m
+              memory: 1Gi
+          storageSpec:
+            volumeClaimTemplate:
+              spec:
+                accessModes: ["ReadWriteOnce"]
+                resources:
+                  requests:
+                    storage: 10Gi
+      
+      # Grafana Configuration
+      grafana:
+        enabled: true
+        adminPassword: admin
+        service:
+          type: NodePort
+          nodePort: 30080
+        resources:
+          limits:
+            cpu: 200m
+            memory: 256Mi
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        persistence:
+          enabled: true
+          size: 5Gi
+      
+      # AlertManager Configuration
+      alertmanager:
+        alertmanagerSpec:
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+      
+      # Node Exporter Configuration
+      nodeExporter:
+        enabled: true
+      
+      # Kube State Metrics Configuration
+      kubeStateMetrics:
+        enabled: true
+      
+      # Disable components not needed in small clusters
+      kubeControllerManager:
+        enabled: false
+      kubeScheduler:
+        enabled: false
+      kubeProxy:
+        enabled: true
+      kubeEtcd:
+        enabled: false
+    owner: ubuntu
+    group: ubuntu
+    mode: '0644'
+
+- name: Check if Prometheus stack is already installed
+  become: yes
+  become_user: ubuntu
+  shell: |
+    helm list -n monitoring | grep prometheus || echo "not_installed"
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  register: prometheus_installed
+  changed_when: false
+
+- name: Install Prometheus Stack using Helm
+  become: yes
   become_user: ubuntu
   shell: |
     helm upgrade --install prometheus prometheus-community/kube-prometheus-stack \
       --namespace monitoring \
       --create-namespace \
+      --values /tmp/prometheus-values.yaml \
       --wait \
-      --timeout 15m0s \
-      --set grafana.adminPassword=prom-operator
+      --timeout 15m
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  when: "'not_installed' in prometheus_installed.stdout"
+  register: helm_install
+  retries: 2
+  delay: 30
+  ignore_errors: yes
+
+- name: Wait for Prometheus Operator to be ready
+  become: yes
+  become_user: ubuntu
+  shell: |
+    kubectl wait --for=condition=Available --timeout=600s deployment/prometheus-kube-prometheus-operator -n monitoring
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  retries: 3
+  delay: 30
+  ignore_errors: yes
+
+- name: Wait for Prometheus pods to be ready
+  become: yes
+  become_user: ubuntu
+  shell: |
+    kubectl wait --for=condition=Ready --timeout=600s pods -l app.kubernetes.io/name=prometheus -n monitoring
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  retries: 3
+  delay: 30
+  ignore_errors: yes
+
+- name: Wait for Grafana pods to be ready
+  become: yes
+  become_user: ubuntu
+  shell: |
+    kubectl wait --for=condition=Ready --timeout=600s pods -l app.kubernetes.io/name=grafana -n monitoring
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  retries: 3
+  delay: 30
+  ignore_errors: yes
+
+- name: Get Grafana admin password
+  become: yes
+  become_user: ubuntu
+  shell: |
+    kubectl get secret -n monitoring prometheus-grafana -o jsonpath="{.data.admin-password}" | base64 --decode
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  register: grafana_password
+  changed_when: false
+
+- name: Get Grafana service details
+  become: yes
+  become_user: ubuntu
+  shell: |
+    kubectl get svc -n monitoring prometheus-grafana -o jsonpath='{.spec.type}:{.spec.ports[0].nodePort}'
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  register: grafana_service
+  changed_when: false
+
+- name: Get Prometheus service details
+  become: yes
+  become_user: ubuntu
+  shell: |
+    kubectl get svc -n monitoring prometheus-kube-prometheus-prometheus
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  register: prometheus_service
+  changed_when: false
+
+- name: Display monitoring stack information
+  debug:
+    msg:
+      - "========================================="
+      - "Monitoring Stack Deployment Complete!"
+      - "========================================="
+      - "Grafana Access:"
+      - "  - Service Type: {{ grafana_service.stdout.split(':')[0] }}"
+      - "  - NodePort: {{ grafana_service.stdout.split(':')[1] }}"
+      - "  - Username: admin"
+      - "  - Password: {{ grafana_password.stdout }}"
+      - ""
+      - "Access Grafana:"
+      - "  kubectl port-forward -n monitoring svc/prometheus-grafana 3000:80"
+      - "  Then browse to: http://localhost:3000"
+      - ""
+      - "Access Prometheus:"
+      - "  kubectl port-forward -n monitoring svc/prometheus-kube-prometheus-prometheus 9090:9090"
+      - "  Then browse to: http://localhost:9090"
+      - ""
+      - "View all monitoring pods:"
+      - "  kubectl get pods -n monitoring"
+      - "========================================="
+
+- name: Create monitoring dashboard ConfigMap
+  become: yes
+  become_user: ubuntu
+  shell: |
+    kubectl create configmap monitoring-info -n monitoring \
+      --from-literal=grafana-password="{{ grafana_password.stdout }}" \
+      --from-literal=access-info="Port-forward with: kubectl port-forward -n monitoring svc/prometheus-grafana 3000:80" \
+      --dry-run=client -o yaml | kubectl apply -f -
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  changed_when: false
+
+- name: Verify all monitoring components are running
+  become: yes
+  become_user: ubuntu
+  shell: |
+    kubectl get pods -n monitoring -o wide
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  register: monitoring_pods
+  changed_when: false
+
+- name: Display monitoring pods status
+  debug:
+    var: monitoring_pods.stdout_lines
