@@ -1,6 +1,7 @@
 ---
-# Monitoring Role - Main Tasks
+# Monitoring Role - Main Tasks with Cinder Volume Support
 # Deploys Prometheus, Grafana, and full monitoring stack on master node
+# Supports both Cinder partitioned volumes and local-path provisioner
 
 - name: Wait for all cluster nodes to be ready
   become: yes
@@ -19,12 +20,13 @@
   become: yes
   become_user: ubuntu
   shell: |
-    kubectl wait --for=condition=Ready pods -l k8s-app=kube-dns -n kube-system --timeout=300s
+    kubectl wait --for=condition=Ready pods -l k8s-app=kube-dns -n kube-system --timeout=180s || true
   environment:
     KUBECONFIG: /home/ubuntu/.kube/config
-  retries: 3
+  retries: 2
   delay: 20
   ignore_errors: yes
+  changed_when: false
 
 - name: Check if Helm is installed
   shell: command -v helm
@@ -59,17 +61,6 @@
   retries: 3
   delay: 10
 
-- name: Add Grafana Helm repository
-  become: yes
-  become_user: ubuntu
-  shell: |
-    helm repo add grafana https://grafana.github.io/helm-charts
-  environment:
-    KUBECONFIG: /home/ubuntu/.kube/config
-  changed_when: false
-  retries: 3
-  delay: 10
-
 - name: Update Helm repositories
   become: yes
   become_user: ubuntu
@@ -90,6 +81,152 @@
     KUBECONFIG: /home/ubuntu/.kube/config
   changed_when: false
 
+- name: Check if using Cinder storage
+  set_fact:
+    using_cinder: "{{ use_cinder | default(false) }}"
+    cinder_storage_path: "{{ storage_path | default('/mnt/k8s-storage') }}"
+    storage_class_name: "{{ 'manual' if (use_cinder | default(false)) else 'local-path' }}"
+
+- name: Display storage configuration
+  debug:
+    msg:
+      - "Using Cinder: {{ using_cinder }}"
+      - "Storage Path: {{ cinder_storage_path }}"
+      - "StorageClass: {{ storage_class_name }}"
+
+# === CINDER STORAGE SETUP ===
+- name: Create Persistent Volumes for Cinder storage
+  become: yes
+  become_user: ubuntu
+  shell: |
+    cat <<EOF | kubectl apply -f -
+    apiVersion: v1
+    kind: PersistentVolume
+    metadata:
+      name: prometheus-pv
+    spec:
+      capacity:
+        storage: 15Gi
+      accessModes:
+        - ReadWriteOnce
+      persistentVolumeReclaimPolicy: Retain
+      storageClassName: manual
+      hostPath:
+        path: {{ cinder_storage_path }}/prometheus
+        type: DirectoryOrCreate
+      nodeAffinity:
+        required:
+          nodeSelectorTerms:
+          - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+              - k8s-master
+    ---
+    apiVersion: v1
+    kind: PersistentVolume
+    metadata:
+      name: grafana-pv
+    spec:
+      capacity:
+        storage: 5Gi
+      accessModes:
+        - ReadWriteOnce
+      persistentVolumeReclaimPolicy: Retain
+      storageClassName: manual
+      hostPath:
+        path: {{ cinder_storage_path }}/grafana
+        type: DirectoryOrCreate
+      nodeAffinity:
+        required:
+          nodeSelectorTerms:
+          - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+              - k8s-master
+    ---
+    apiVersion: v1
+    kind: PersistentVolume
+    metadata:
+      name: alertmanager-pv
+    spec:
+      capacity:
+        storage: 5Gi
+      accessModes:
+        - ReadWriteOnce
+      persistentVolumeReclaimPolicy: Retain
+      storageClassName: manual
+      hostPath:
+        path: {{ cinder_storage_path }}/alertmanager
+        type: DirectoryOrCreate
+      nodeAffinity:
+        required:
+          nodeSelectorTerms:
+          - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+              - k8s-master
+    EOF
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  when: using_cinder | bool
+  changed_when: false
+
+# === LOCAL-PATH PROVISIONER SETUP (fallback) ===
+- name: Check if local-path storage provisioner exists
+  become: yes
+  become_user: ubuntu
+  shell: |
+    kubectl get deployment -n local-path-storage local-path-provisioner 2>/dev/null || echo "not_found"
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  register: storage_check
+  changed_when: false
+  when: not (using_cinder | bool)
+
+- name: Install local-path storage provisioner
+  become: yes
+  become_user: ubuntu
+  shell: |
+    kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.28/deploy/local-path-storage.yaml
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  when:
+    - not (using_cinder | bool)
+    - "'not_found' in storage_check.stdout"
+  retries: 3
+  delay: 10
+
+- name: Wait for local-path-provisioner to be ready
+  become: yes
+  become_user: ubuntu
+  shell: |
+    kubectl wait --for=condition=Ready pod -l app=local-path-provisioner -n local-path-storage --timeout=120s
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  when:
+    - not (using_cinder | bool)
+    - "'not_found' in storage_check.stdout"
+  retries: 2
+  delay: 10
+  ignore_errors: yes
+
+- name: Set local-path as default StorageClass
+  become: yes
+  become_user: ubuntu
+  shell: |
+    kubectl patch storageclass local-path -p '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  when:
+    - not (using_cinder | bool)
+    - "'not_found' in storage_check.stdout"
+  changed_when: false
+  ignore_errors: yes
+
+# === PROMETHEUS HELM VALUES ===
 - name: Create custom values file for Prometheus stack
   copy:
     dest: /tmp/prometheus-values.yaml
@@ -118,6 +255,7 @@
           storageSpec:
             volumeClaimTemplate:
               spec:
+                storageClassName: {{ storage_class_name }}
                 accessModes: ["ReadWriteOnce"]
                 resources:
                   requests:
@@ -139,11 +277,13 @@
             memory: 128Mi
         persistence:
           enabled: true
-          size: 5Gi
+          storageClassName: {{ storage_class_name }}
+          size: 4Gi
       
       # AlertManager Configuration
       alertmanager:
         alertmanagerSpec:
+          retention: 120h
           resources:
             requests:
               cpu: 100m
@@ -151,6 +291,14 @@
             limits:
               cpu: 200m
               memory: 256Mi
+          storage:
+            volumeClaimTemplate:
+              spec:
+                storageClassName: {{ storage_class_name }}
+                accessModes: ["ReadWriteOnce"]
+                resources:
+                  requests:
+                    storage: 4Gi
       
       # Node Exporter Configuration
       nodeExporter:
@@ -192,11 +340,13 @@
       --create-namespace \
       --values /tmp/prometheus-values.yaml \
       --wait \
-      --timeout 15m
+      --timeout 20m
   environment:
     KUBECONFIG: /home/ubuntu/.kube/config
   when: "'not_installed' in prometheus_installed.stdout"
   register: helm_install
+  async: 1800
+  poll: 10
   retries: 2
   delay: 30
   ignore_errors: yes
@@ -270,6 +420,9 @@
       - "========================================="
       - "Monitoring Stack Deployment Complete!"
       - "========================================="
+      - "Storage Type: {{ 'Cinder Partitioned' if using_cinder else 'Local-Path' }}"
+      - "Storage Class: {{ storage_class_name }}"
+      - ""
       - "Grafana Access:"
       - "  - Service Type: {{ grafana_service.stdout.split(':')[0] }}"
       - "  - NodePort: {{ grafana_service.stdout.split(':')[1] }}"
@@ -294,6 +447,7 @@
   shell: |
     kubectl create configmap monitoring-info -n monitoring \
       --from-literal=grafana-password="{{ grafana_password.stdout }}" \
+      --from-literal=storage-type="{{ 'Cinder' if using_cinder else 'Local-Path' }}" \
       --from-literal=access-info="Port-forward with: kubectl port-forward -n monitoring svc/prometheus-grafana 3000:80" \
       --dry-run=client -o yaml | kubectl apply -f -
   environment:
@@ -313,3 +467,19 @@
 - name: Display monitoring pods status
   debug:
     var: monitoring_pods.stdout_lines
+
+- name: Display storage information (Cinder only)
+  become: yes
+  become_user: ubuntu
+  shell: |
+    kubectl get pv,pvc -n monitoring
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  register: storage_info
+  changed_when: false
+  when: using_cinder | bool
+
+- name: Show storage details
+  debug:
+    var: storage_info.stdout_lines
+  when: using_cinder | bool
