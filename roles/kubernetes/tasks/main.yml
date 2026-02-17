@@ -107,7 +107,7 @@
 
 # ---------- WORKER ONLY ----------
 
--- name: Generate join command (master)
+- name: Generate join command (master)
   shell: kubeadm token create --print-join-command
   register: join_cmd
   when: node_role == "master"
