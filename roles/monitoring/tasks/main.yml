@@ -1,30 +1,30 @@
-# monitoring/tasks/main.yml - DEFINITIVE FIX
+# monitoring/tasks/main.yml - WORKING FIX FOR YOUR SETUP
 
-- name: Wait for CoreDNS deployment to be Available
+- name: Wait for CoreDNS pods to be Ready (using correct label kube-dns)
   become_user: ubuntu
-  command: kubectl wait --for=condition=Available deployment/coredns -n kube-system --timeout=600s
-  retries: 12
+  command: kubectl wait --for=condition=Ready pods -n kube-system -l k8s-app=kube-dns --timeout=600s
+  retries: 10
   delay: 20
   register: coredns_wait
   until: coredns_wait.rc == 0
 
-- name: Wait for Calico node daemonset to be Available
+- name: Wait for Calico node pods to be Ready
   become_user: ubuntu
-  command: kubectl wait --for=condition=Available daemonset/calico-node -n kube-system --timeout=600s
-  retries: 12
+  command: kubectl wait --for=condition=Ready pods -n kube-system -l k8s-app=calico-node --timeout=600s
+  retries: 10
   delay: 20
   register: calico_wait
   until: calico_wait.rc == 0
 
-- name: Wait for kube-proxy daemonset to be Available
+- name: Wait for kube-proxy pods to be Ready
   become_user: ubuntu
-  command: kubectl wait --for=condition=Available daemonset/kube-proxy -n kube-system --timeout=600s
-  retries: 12
+  command: kubectl wait --for=condition=Ready pods -n kube-system -l k8s-app=kube-proxy --timeout=600s
+  retries: 10
   delay: 20
   register: kubeproxy_wait
   until: kubeproxy_wait.rc == 0
 
-- name: Install Helm if missing
+- name: Install Helm if not present
   shell: |
     if ! command -v helm >/dev/null 2>&1; then
       curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
@@ -32,9 +32,9 @@
   args:
     creates: /usr/local/bin/helm
 
-- name: Add/update Prometheus Helm repo
+- name: Add Prometheus Helm repo
   shell: |
-    helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+    helm repo add prometheus-community https://prometheus-community.github.io/helm-charts --force-update
     helm repo update
 
 - name: Deploy kube-prometheus-stack
@@ -46,3 +46,5 @@
       --wait \
       --timeout 15m0s \
       --set grafana.adminPassword=prom-operator
+  register: helm_deploy
+  changed_when: helm_deploy.rc == 0
