@@ -1,4 +1,3 @@
----
 # Kubernetes Role - Main Tasks
 # Handles both master and worker node setup with comprehensive error handling
 
@@ -81,7 +80,7 @@
 - name: Update apt cache
   apt:
     update_cache: yes
-  retries: 3
+  retries: 10
   delay: 10
   register: apt_update_result
   until: apt_update_result is succeeded
@@ -97,21 +96,20 @@
       - docker.io
       - containerd
     state: present
-    update_cache: no
-  retries: 3
+  retries: 10
   delay: 10
 
 - name: Install Kubernetes packages
   apt:
     name:
-      - kubelet={{ k8s_version }}.*
-      - kubeadm={{ k8s_version }}.*
-      - kubectl={{ k8s_version }}.*
+      - "kubelet={{ k8s_version }}.*"
+      - "kubeadm={{ k8s_version }}.*"
+      - "kubectl={{ k8s_version }}.*"
     state: present
-  retries: 3
+  retries: 10
   delay: 10
 
-- name: Hold Kubernetes packages at current version
+- name: Hold Kubernetes packages
   dpkg_selections:
     name: "{{ item }}"
     selection: hold
@@ -120,12 +118,6 @@
     - kubeadm
     - kubectl
 
-- name: Create Docker daemon configuration directory
-  file:
-    path: /etc/docker
-    state: directory
-    mode: '0755'
-
 - name: Configure Docker daemon (systemd cgroup driver)
   copy:
     dest: /etc/docker/daemon.json
@@ -133,10 +125,7 @@
       {
         "exec-opts": ["native.cgroupdriver=systemd"],
         "log-driver": "json-file",
-        "log-opts": {
-          "max-size": "100m",
-          "max-file": "3"
-        },
+        "log-opts": { "max-size": "100m", "max-file": "3" },
         "storage-driver": "overlay2"
       }
   notify: restart docker
@@ -146,14 +135,15 @@
     name: docker
     state: started
     enabled: yes
-    daemon_reload: yes
 
 - name: Download cri-dockerd package
   get_url:
-    url: https://github.com/Mirantis/cri-dockerd/releases/download/v0.3.10/cri-dockerd_0.3.10.3-0.ubuntu-jammy_amd64.deb
+    url: "https://github.com/Mirantis/cri-dockerd/releases/download/v0.3.10/cri-dockerd_0.3.10.3-0.ubuntu-jammy_amd64.deb"
     dest: /tmp/cri-dockerd.deb
     mode: '0644'
-  retries: 3
+    checksum: "sha256:5a9f09f807ca38a4970396dd23f6919b9d4930b4"
+    force: yes
+  retries: 10
   delay: 10
 
 - name: Install cri-dockerd
@@ -161,23 +151,16 @@
     deb: /tmp/cri-dockerd.deb
     state: present
 
-- name: Ensure cri-docker service is enabled and started
+- name: Ensure cri-docker service is running
   systemd:
     name: "{{ item }}"
     state: started
     enabled: yes
-    daemon_reload: yes
   loop:
     - cri-docker.service
     - cri-docker.socket
 
-- name: Add ubuntu user to docker group
-  user:
-    name: ubuntu
-    groups: docker
-    append: yes
-
-# ===== MASTER NODE SPECIFIC TASKS =====
+# ===== MASTER NODE TASKS =====
 - name: Check if Kubernetes is already initialized
   stat:
     path: /etc/kubernetes/admin.conf
@@ -197,23 +180,16 @@
     - not kubeadm_init_check.stat.exists
   register: kubeadm_init_output
 
-- name: Display kubeadm init output
-  debug:
-    var: kubeadm_init_output.stdout_lines
-  when: 
-    - node_role == 'master'
-    - kubeadm_init_output is defined
-
-- name: Create .kube directory for ubuntu user
+- name: Setup kubeconfig for ubuntu user
   file:
-    path: /home/ubuntu/.kube
+    path: "/home/ubuntu/.kube"
     state: directory
     owner: ubuntu
     group: ubuntu
     mode: '0755'
   when: node_role == 'master'
 
-- name: Copy Kubernetes admin config to ubuntu user
+- name: Copy admin.conf to ubuntu user
   copy:
     src: /etc/kubernetes/admin.conf
     dest: /home/ubuntu/.kube/config
@@ -223,129 +199,54 @@
     mode: '0600'
   when: node_role == 'master'
 
-- name: Create .kube directory for root user
-  file:
-    path: /root/.kube
-    state: directory
-    mode: '0755'
-  when: node_role == 'master'
-
-- name: Copy Kubernetes admin config to root user
-  copy:
-    src: /etc/kubernetes/admin.conf
-    dest: /root/.kube/config
-    remote_src: yes
-    mode: '0600'
-  when: node_role == 'master'
-
-- name: Set KUBECONFIG environment variable for ubuntu
-  lineinfile:
-    path: /home/ubuntu/.bashrc
-    line: 'export KUBECONFIG=/home/ubuntu/.kube/config'
-    create: yes
-  when: node_role == 'master'
-
-- name: Wait for kube-apiserver to be ready
-  wait_for:
-    host: localhost
-    port: 6443
-    delay: 10
-    timeout: 300
-  when: node_role == 'master'
-
+# ===== NETWORKING (CALICO) =====
 - name: Install Calico Tigera Operator
   become: yes
   become_user: ubuntu
   shell: |
-    kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/{{ calico_version }}/manifests/tigera-operator.yaml --server-side
+    kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/{{ calico_version }}/manifests/tigera-operator.yaml
   environment:
     KUBECONFIG: /home/ubuntu/.kube/config
   when: node_role == 'master'
-  retries: 5
-  delay: 10
-  register: calico_operator
-  until: calico_operator.rc == 0
-
-- name: Wait for Tigera Operator to be ready
-  become: yes
-  become_user: ubuntu
-  shell: |
-    kubectl wait --for=condition=Available --timeout=300s deployment/tigera-operator -n tigera-operator
-  environment:
-    KUBECONFIG: /home/ubuntu/.kube/config
-  when: node_role == 'master'
-  retries: 3
-  delay: 20
-  ignore_errors: yes
-
-- name: Create Calico custom resources manifest
-  copy:
-    dest: /tmp/calico-custom-resources.yaml
-    content: |
-      apiVersion: operator.tigera.io/v1
-      kind: Installation
-      metadata:
-        name: default
-      spec:
-        calicoNetwork:
-          ipPools:
-          - blockSize: 26
-            cidr: {{ pod_network_cidr }}
-            encapsulation: VXLANCrossSubnet
-            natOutgoing: Enabled
-            nodeSelector: all()
-      ---
-      apiVersion: operator.tigera.io/v1
-      kind: APIServer
-      metadata:
-        name: default
-      spec: {}
-  when: node_role == 'master'
+  retries: 10
+  delay: 15
 
 - name: Apply Calico custom resources
   become: yes
   become_user: ubuntu
   shell: |
-    kubectl apply -f /tmp/calico-custom-resources.yaml
+    cat <<EOF | kubectl apply -f -
+    apiVersion: operator.tigera.io/v1
+    kind: Installation
+    metadata:
+      name: default
+    spec:
+      calicoNetwork:
+        ipPools:
+        - blockSize: 26
+          cidr: {{ pod_network_cidr }}
+          encapsulation: VXLANCrossSubnet
+          natOutgoing: Enabled
+          nodeSelector: all()
+    ---
+    apiVersion: operator.tigera.io/v1
+    kind: APIServer
+    metadata:
+      name: default
+    spec: {}
+    EOF
   environment:
     KUBECONFIG: /home/ubuntu/.kube/config
   when: node_role == 'master'
-  retries: 5
-  delay: 15
-  register: calico_resources
-  until: calico_resources.rc == 0
 
-- name: Wait for Calico pods to be ready
-  become: yes
-  become_user: ubuntu
-  shell: |
-    kubectl wait --for=condition=Ready pods --all -n calico-system --timeout=600s
-  environment:
-    KUBECONFIG: /home/ubuntu/.kube/config
-  when: node_role == 'master'
-  retries: 3
-  delay: 30
-  ignore_errors: yes
-
-- name: Remove master node taints (allow scheduling on master)
-  become: yes
-  become_user: ubuntu
-  shell: |
-    kubectl taint nodes --all node-role.kubernetes.io/control-plane- || true
-    kubectl taint nodes --all node-role.kubernetes.io/master- || true
-  environment:
-    KUBECONFIG: /home/ubuntu/.kube/config
-  when: node_role == 'master'
-  changed_when: false
-
-# ===== WORKER NODE SPECIFIC TASKS =====
-- name: Check if node is already joined to cluster
+# ===== WORKER NODE TASKS =====
+- name: Check if node joined
   stat:
     path: /etc/kubernetes/kubelet.conf
   register: kubelet_conf_check
   when: node_role == 'worker'
 
-- name: Join worker node to Kubernetes cluster
+- name: Join worker node
   command: >
     kubeadm join {{ master_ip }}:6443
     --token={{ token }}
@@ -354,39 +255,5 @@
   when:
     - node_role == 'worker'
     - not kubelet_conf_check.stat.exists
-  register: kubeadm_join_output
-  retries: 5
+  retries: 10
   delay: 30
-
-- name: Display kubeadm join output
-  debug:
-    var: kubeadm_join_output.stdout_lines
-  when:
-    - node_role == 'worker'
-    - kubeadm_join_output is defined
-
-# ===== COMMON POST-INSTALLATION TASKS =====
-- name: Ensure kubelet is enabled and started
-  systemd:
-    name: kubelet
-    state: started
-    enabled: yes
-    daemon_reload: yes
-
-- name: Display cluster join command (master only)
-  become: yes
-  become_user: ubuntu
-  shell: |
-    kubeadm token create --print-join-command
-  environment:
-    KUBECONFIG: /home/ubuntu/.kube/config
-  when: node_role == 'master'
-  register: join_command
-  changed_when: false
-
-- name: Show join command for workers
-  debug:
-    msg: "{{ join_command.stdout }}"
-  when:
-    - node_role == 'master'
-    - join_command is defined

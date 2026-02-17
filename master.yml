@@ -3,34 +3,46 @@
   hosts: localhost
   connection: local
   become: yes
+  
+  # Variables are passed from Heat/ansible-pull via -e (extra-vars)
   vars:
-    node_role: "{{ node_role | default('unknown') }}"
-    master_ip: "{{ master_ip | default('') }}"
-    token: "{{ token | default('abcdef.1234567890abcdef') }}"
-    pod_network_cidr: "{{ pod_network_cidr | default('192.168.0.0/16') }}"
     k8s_version: "1.29"
     calico_version: "v3.27.0"
-    use_cinder: "{{ use_cinder | default(false) }}"
+    # Default values for optional vars
+    pod_network_cidr: "{{ pod_network_cidr | default('192.168.0.0/16') }}"
     storage_path: "{{ storage_path | default('/mnt/k8s-storage') }}"
+
   pre_tasks:
-    - name: Validate required variables
-      fail:
-        msg: "Variable 'node_role' must be 'master' or 'worker'."
-      when: node_role not in ["master", "worker"]
-    
-    - name: Validate master_ip for worker nodes
-      fail:
-        msg: "Variable 'master_ip' is required for worker nodes."
-      when: node_role == "worker" and (master_ip is not defined or master_ip == "")
-    
-    - name: Display deployment info
+    - name: "CRITICAL CLEANUP: Remove corrupted files and fix apt locks"
+      shell: |
+        rm -f /tmp/cri-dockerd.deb
+        rm -f /var/lib/dpkg/lock*
+        rm -f /var/lib/apt/lists/lock*
+        rm -f /var/cache/apt/archives/lock
+        dpkg --configure -a
+      ignore_errors: yes
+      changed_when: false
+
+    - name: "VALIDATION: Ensure node_role is set correctly"
+      assert:
+        that:
+          - node_role is defined
+          - node_role in ["master", "worker"]
+        fail_msg: "node_role must be 'master' or 'worker'. Currently: {{ node_role | default('undefined') }}"
+
+    - name: "VALIDATION: Ensure master_ip is provided for workers"
+      assert:
+        that:
+          - (node_role == 'master') or (master_ip is defined and master_ip != "")
+        fail_msg: "master_ip is required when node_role is 'worker'."
+
+    - name: "Display deployment info"
       debug:
         msg:
-          - "Node Role: {{ node_role }}"
-          - "Master IP: {{ master_ip }}"
-          - "Pod Network CIDR: {{ pod_network_cidr }}"
-          - "Kubernetes Version: {{ k8s_version }}"
-  
+          - "Deploying as: {{ node_role }}"
+          - "Targeting Master: {{ master_ip | default('Self') }}"
+          - "Network: {{ pod_network_cidr }}"
+
   roles:
     - role: kubernetes
     - role: monitoring
