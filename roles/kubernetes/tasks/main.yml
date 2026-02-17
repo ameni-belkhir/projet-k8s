@@ -1,5 +1,4 @@
 # ---------- SYSTEM PREP (ALL NODES) ----------
-
 - name: Wait for APT lock
   shell: while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do sleep 5; done;
   changed_when: false
@@ -33,15 +32,24 @@
     - { key: 'net.ipv4.ip_forward', value: '1' }
 
 # ---------- INSTALL PACKAGES ----------
+- name: Ensure /etc/apt/keyrings directory exists
+  file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: '0755'
 
-- name: Kubernetes repo
+- name: Add Kubernetes apt key
   shell: |
-    mkdir -p /etc/apt/keyrings
     curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key | \
       gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg --yes
-    echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] \
-      https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /" \
-      > /etc/apt/sources.list.d/kubernetes.list
+  args:
+    creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+- name: Add Kubernetes repository
+  copy:
+    content: |
+      deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /
+    dest: /etc/apt/sources.list.d/kubernetes.list
 
 - name: Install packages
   apt:
@@ -57,11 +65,14 @@
   file:
     path: /etc/containerd
     state: directory
+    mode: '0755'
 
 - name: Configure containerd
   shell: |
     containerd config default > /etc/containerd/config.toml
     sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+  args:
+    creates: /etc/containerd/config.toml
 
 - name: Restart containerd
   systemd:
@@ -70,9 +81,8 @@
     enabled: yes
 
 # ---------- MASTER ONLY ----------
-
 - name: Init cluster
-  command: kubeadm init --pod-network-cidr={{ pod_network_cidr }}
+  command: kubeadm init --apiserver-advertise-address={{ master_ip }} --pod-network-cidr={{ pod_network_cidr }}
   when: node_role == "master"
   args:
     creates: /etc/kubernetes/admin.conf
@@ -83,6 +93,7 @@
     state: directory
     owner: ubuntu
     group: ubuntu
+    mode: '0755'
   when: node_role == "master"
 
 - name: Copy kubeconfig
@@ -92,41 +103,51 @@
     remote_src: yes
     owner: ubuntu
     group: ubuntu
+    mode: '0644'
   when: node_role == "master"
 
-- name: Install Calico (stable manifest)
+- name: Install Calico
   become_user: ubuntu
-  command: kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.26.4/manifests/calico.yaml
+  command: kubectl apply -f https://docs.projectcalico.org/manifests/calico.yaml
   when: node_role == "master"
 
-- name: Wait for nodes Ready
+- name: Wait for CoreDNS to be ready (for single-node initial readiness)
   become_user: ubuntu
-  shell: |
-    until kubectl get nodes | grep -v NotReady; do sleep 10; done
+  shell: kubectl wait --for=condition=Available deployment/coredns -n kube-system --timeout=300s
   when: node_role == "master"
+  ignore_errors: yes
 
-# ---------- WORKER ONLY ----------
-
-- name: Generate join command (master)
-  shell: kubeadm token create --print-join-command
+# ---------- JOIN COMMAND HANDLING ----------
+- name: Generate persistent join command (master)
+  shell: kubeadm token create --ttl 0 --print-join-command
   register: join_cmd
   when: node_role == "master"
+  changed_when: true
 
-- name: Save join command
+- name: Save join command to file (master)
   copy:
+    content: "{{ join_cmd.stdout }}\n"
     dest: /tmp/join.sh
-    content: "{{ join_cmd.stdout }}"
+    mode: '0755'
+    owner: root
+    group: root
   when: node_role == "master"
 
-- name: Fetch join script
-  fetch:
-    src: /tmp/join.sh
-    dest: /tmp/join.sh
-    flat: yes
-  when: node_role == "master"
+- name: Fetch join command from master (worker)
+  shell: |
+    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+      ubuntu@{{ master_ip }} "sudo cat /tmp/join.sh" > /tmp/join.sh
+    chmod +x /tmp/join.sh
+  args:
+    creates: /tmp/join.sh
+  when: node_role == "worker"
+  retries: 20
+  delay: 10
+  register: fetch_result
+  until: fetch_result.rc == 0
 
 - name: Join cluster (worker)
-  shell: "{{ lookup('file', '/tmp/join.sh') }}"
+  command: bash /tmp/join.sh
   when: node_role == "worker"
   args:
     creates: /etc/kubernetes/kubelet.conf
