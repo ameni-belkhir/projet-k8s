@@ -1,258 +1,186 @@
-# Kubernetes Role - Main Tasks
-# Handles both master and worker node setup with comprehensive error handling
+---
+# =============================================================================
+# Role: kubernetes
+# Description: K8s cluster (controller=master, compute=worker)
+# Source: nouveau (pas de script shell existant)
+# Cible: controller (puis delegation au compute pour join)
+# =============================================================================
 
-- name: Wait for apt locks to be released
-  shell: |
-    while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || \
-          fuser /var/lib/dpkg/lock >/dev/null 2>&1 || \
-          fuser /var/lib/apt/lists/lock >/dev/null 2>&1 || \
-          fuser /var/cache/apt/archives/lock >/dev/null 2>&1; do
-      echo "Waiting for apt locks..."
-      sleep 5
-    done
-  changed_when: false
-
-- name: Fix interrupted dpkg installations
-  shell: |
-    dpkg --configure -a
-    apt-get install -f -y
-  ignore_errors: yes
-  changed_when: false
-
-- name: Disable swap immediately
+# --- 1. Prerequisites sur controller ET compute ---
+- name: Desactiver le swap
   shell: swapoff -a
-  when: ansible_swaptotal_mb > 0
   changed_when: false
 
-- name: Disable swap permanently in fstab
-  replace:
+- name: Supprimer swap du fstab
+  lineinfile:
     path: /etc/fstab
-    regexp: '^([^#].*?\sswap\s+.*)$'
-    replace: '# \1'
-  when: ansible_swaptotal_mb > 0
+    regexp: '\sswap\s'
+    state: absent
 
-- name: Load required kernel modules
-  modprobe:
-    name: "{{ item }}"
-    state: present
-  loop:
-    - overlay
-    - br_netfilter
-
-- name: Persist kernel modules on boot
+- name: Charger les modules kernel necessaires
   copy:
     dest: /etc/modules-load.d/k8s.conf
     content: |
       overlay
       br_netfilter
 
-- name: Configure sysctl for Kubernetes networking
-  sysctl:
-    name: "{{ item.key }}"
-    value: "{{ item.value }}"
-    state: present
-    reload: yes
-    sysctl_file: /etc/sysctl.d/k8s.conf
-  loop:
-    - { key: 'net.bridge.bridge-nf-call-iptables', value: '1' }
-    - { key: 'net.bridge.bridge-nf-call-ip6tables', value: '1' }
-    - { key: 'net.ipv4.ip_forward', value: '1' }
+- name: Charger les modules maintenant
+  shell: modprobe overlay && modprobe br_netfilter
+  changed_when: false
 
-- name: Create apt keyrings directory
-  file:
-    path: /etc/apt/keyrings
-    state: directory
-    mode: '0755'
+- name: Configurer sysctl pour K8s
+  copy:
+    dest: /etc/sysctl.d/k8s.conf
+    content: |
+      net.bridge.bridge-nf-call-iptables  = 1
+      net.bridge.bridge-nf-call-ip6tables = 1
+      net.ipv4.ip_forward                 = 1
 
-- name: Add Kubernetes apt signing key
+- name: Appliquer sysctl
+  shell: sysctl --system
+  changed_when: false
+
+# --- 2. Repository Kubernetes ---
+- name: Ajouter la cle GPG Kubernetes
   shell: |
     curl -fsSL https://pkgs.k8s.io/core:/stable:/v{{ k8s_version }}/deb/Release.key | \
-    gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg --yes
+    gpg --dearmor -o /usr/share/keyrings/kubernetes-apt-keyring.gpg
   args:
-    creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+    creates: /usr/share/keyrings/kubernetes-apt-keyring.gpg
 
-- name: Add Kubernetes apt repository
+- name: Ajouter le repository Kubernetes
   copy:
     dest: /etc/apt/sources.list.d/kubernetes.list
     content: |
-      deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v{{ k8s_version }}/deb/ /
+      deb [signed-by=/usr/share/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v{{ k8s_version }}/deb/ /
 
-- name: Update apt cache
+- name: Mettre a jour apt cache
   apt:
     update_cache: yes
-  retries: 10
-  delay: 10
-  register: apt_update_result
-  until: apt_update_result is succeeded
 
-- name: Install Docker and container runtime dependencies
+# --- 3. Installation K8s ---
+- name: Installer kubelet kubeadm kubectl et iptables
   apt:
     name:
-      - apt-transport-https
-      - ca-certificates
-      - curl
-      - gnupg
-      - lsb-release
-      - docker.io
-      - containerd
+      - kubelet
+      - kubeadm
+      - kubectl
+      - iptables
     state: present
-  retries: 10
-  delay: 10
 
-- name: Install Kubernetes packages
-  apt:
-    name:
-      - "kubelet={{ k8s_version }}.*"
-      - "kubeadm={{ k8s_version }}.*"
-      - "kubectl={{ k8s_version }}.*"
-    state: present
-  retries: 10
-  delay: 10
+- name: Verrouiller les versions K8s
+  shell: apt-mark hold kubelet kubeadm kubectl
+  changed_when: false
 
-- name: Hold Kubernetes packages
-  dpkg_selections:
-    name: "{{ item }}"
-    selection: hold
-  loop:
-    - kubelet
-    - kubeadm
-    - kubectl
+# --- 4. Prerequisites sur compute (delegue) ---
+- name: Desactiver swap sur compute
+  shell: swapoff -a
+  delegate_to: compute
+  changed_when: false
 
-- name: Configure Docker daemon (systemd cgroup driver)
+- name: Supprimer swap du fstab sur compute
+  lineinfile:
+    path: /etc/fstab
+    regexp: '\sswap\s'
+    state: absent
+  delegate_to: compute
+
+- name: Modules kernel sur compute
   copy:
-    dest: /etc/docker/daemon.json
+    dest: /etc/modules-load.d/k8s.conf
     content: |
-      {
-        "exec-opts": ["native.cgroupdriver=systemd"],
-        "log-driver": "json-file",
-        "log-opts": { "max-size": "100m", "max-file": "3" },
-        "storage-driver": "overlay2"
-      }
-  notify: restart docker
+      overlay
+      br_netfilter
+  delegate_to: compute
 
-- name: Ensure Docker service is enabled and started
-  systemd:
-    name: docker
-    state: started
-    enabled: yes
+- name: Charger modules sur compute
+  shell: modprobe overlay && modprobe br_netfilter
+  delegate_to: compute
+  changed_when: false
 
-- name: Download cri-dockerd package
-  get_url:
-    url: "https://github.com/Mirantis/cri-dockerd/releases/download/v0.3.10/cri-dockerd_0.3.10.3-0.ubuntu-jammy_amd64.deb"
-    dest: /tmp/cri-dockerd.deb
-    mode: '0644'
-    force: yes
-  retries: 10
-  delay: 10
+- name: Sysctl sur compute
+  copy:
+    dest: /etc/sysctl.d/k8s.conf
+    content: |
+      net.bridge.bridge-nf-call-iptables  = 1
+      net.bridge.bridge-nf-call-ip6tables = 1
+      net.ipv4.ip_forward                 = 1
+  delegate_to: compute
 
-- name: Install cri-dockerd
+- name: Appliquer sysctl sur compute
+  shell: sysctl --system
+  delegate_to: compute
+  changed_when: false
+
+- name: Cle GPG K8s sur compute
+  shell: |
+    curl -fsSL https://pkgs.k8s.io/core:/stable:/v{{ k8s_version }}/deb/Release.key | \
+    gpg --dearmor -o /usr/share/keyrings/kubernetes-apt-keyring.gpg
+  args:
+    creates: /usr/share/keyrings/kubernetes-apt-keyring.gpg
+  delegate_to: compute
+
+- name: Repo K8s sur compute
+  copy:
+    dest: /etc/apt/sources.list.d/kubernetes.list
+    content: |
+      deb [signed-by=/usr/share/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v{{ k8s_version }}/deb/ /
+  delegate_to: compute
+
+- name: Installer K8s et iptables sur compute
   apt:
-    deb: /tmp/cri-dockerd.deb
+    name:
+      - kubelet
+      - kubeadm
+      - kubectl
+      - iptables
     state: present
+    update_cache: yes
+  delegate_to: compute
 
-- name: Ensure cri-docker service is running
-  systemd:
-    name: "{{ item }}"
-    state: started
-    enabled: yes
-  loop:
-    - cri-docker.service
-    - cri-docker.socket
+- name: Verrouiller versions K8s sur compute
+  shell: apt-mark hold kubelet kubeadm kubectl
+  delegate_to: compute
+  changed_when: false
 
-# ===== MASTER NODE TASKS =====
-- name: Check if Kubernetes is already initialized
+# --- 5. Initialiser le Master (controller) ---
+- name: Verifier si le cluster est deja initialise
   stat:
     path: /etc/kubernetes/admin.conf
-  register: kubeadm_init_check
-  when: node_role == 'master'
+  register: k8s_admin_conf
 
-- name: Initialize Kubernetes master
-  command: >
-    kubeadm init
-    --pod-network-cidr={{ pod_network_cidr }}
-    --token={{ token }}
-    --token-ttl=0
-    --cri-socket=unix:///var/run/cri-dockerd.sock
-    --ignore-preflight-errors=NumCPU,Mem
-  when: 
-    - node_role == 'master'
-    - not kubeadm_init_check.stat.exists
-  register: kubeadm_init_output
-
-- name: Setup kubeconfig for ubuntu user
-  file:
-    path: "/home/ubuntu/.kube"
-    state: directory
-    owner: ubuntu
-    group: ubuntu
-    mode: '0755'
-  when: node_role == 'master'
-
-- name: Copy admin.conf to ubuntu user
-  copy:
-    src: /etc/kubernetes/admin.conf
-    dest: /home/ubuntu/.kube/config
-    remote_src: yes
-    owner: ubuntu
-    group: ubuntu
-    mode: '0600'
-  when: node_role == 'master'
-
-# ===== NETWORKING (CALICO) =====
-- name: Install Calico Tigera Operator
-  become: yes
-  become_user: ubuntu
+- name: Initialiser le cluster Kubernetes
   shell: |
-    kubectl apply --server-side -f https://raw.githubusercontent.com/projectcalico/calico/{{ calico_version }}/manifests/tigera-operator.yaml
-  environment:
-    KUBECONFIG: /home/ubuntu/.kube/config
-  when: node_role == 'master'
-  retries: 10
-  delay: 15
+    kubeadm init \
+      --apiserver-advertise-address={{ controller_ip }} \
+      --pod-network-cidr={{ k8s_pod_network_cidr }} \
+      --ignore-preflight-errors=all
+  register: kubeadm_init
+  when: not k8s_admin_conf.stat.exists
 
-- name: Apply Calico custom resources
-  become: yes
-  become_user: ubuntu
+- name: Configurer kubectl pour root
   shell: |
-    cat <<EOF | kubectl apply -f -
-    apiVersion: operator.tigera.io/v1
-    kind: Installation
-    metadata:
-      name: default
-    spec:
-      calicoNetwork:
-        ipPools:
-        - blockSize: 26
-          cidr: {{ pod_network_cidr }}
-          encapsulation: VXLANCrossSubnet
-          natOutgoing: Enabled
-          nodeSelector: all()
-    ---
-    apiVersion: operator.tigera.io/v1
-    kind: APIServer
-    metadata:
-      name: default
-    spec: {}
-    EOF
+    mkdir -p /root/.kube
+    cp -f /etc/kubernetes/admin.conf /root/.kube/config
+    chown root:root /root/.kube/config
+  changed_when: false
+
+# --- 6. Installer Flannel (CNI) ---
+- name: Installer Flannel CNI
+  shell: kubectl apply -f https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml
   environment:
-    KUBECONFIG: /home/ubuntu/.kube/config
-  when: node_role == 'master'
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  changed_when: false
+  ignore_errors: yes
 
-# ===== WORKER NODE TASKS =====
-- name: Check if node joined
-  stat:
-    path: /etc/kubernetes/kubelet.conf
-  register: kubelet_conf_check
-  when: node_role == 'worker'
+# --- 7. Joindre le compute au cluster ---
+- name: Generer la commande join
+  shell: kubeadm token create --print-join-command
+  register: join_command
+  changed_when: false
 
-- name: Join worker node
-  command: >
-    kubeadm join {{ master_ip }}:6443
-    --token={{ token }}
-    --discovery-token-unsafe-skip-ca-verification
-    --cri-socket=unix:///var/run/cri-dockerd.sock
-  when:
-    - node_role == 'worker'
-    - not kubelet_conf_check.stat.exists
-  retries: 10
-  delay: 30
+- name: Joindre le compute au cluster K8s
+  shell: "{{ join_command.stdout }} --ignore-preflight-errors=all"
+  delegate_to: compute
+  ignore_errors: yes
+  changed_when: false

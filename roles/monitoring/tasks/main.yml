@@ -424,16 +424,17 @@
 # ===================== 12. WAIT FOR PODS =====================
 - name: Wait for Prometheus operator pod to be ready
   shell: |
-    kubectl -n monitoring get pods -l app.kubernetes.io/name=prometheus-operator \
-      -o jsonpath='{.items[0].status.conditions[?(@.type=="Ready")].status}'
+    kubectl -n monitoring rollout status deploy -l app.kubernetes.io/instance=prometheus --timeout=120s 2>/dev/null || \
+    kubectl -n monitoring wait --for=condition=Available deploy -l app.kubernetes.io/instance=prometheus --timeout=120s 2>/dev/null || \
+    kubectl -n monitoring get pods -l app.kubernetes.io/name=kube-prometheus-stack-operator --no-headers 2>/dev/null | grep -q Running
   become: yes
   become_user: ubuntu
   environment:
     KUBECONFIG: /home/ubuntu/.kube/config
   register: operator_ready
-  until: operator_ready.stdout == "True"
-  retries: 30
-  delay: 15
+  until: operator_ready.rc == 0
+  retries: 15
+  delay: 20
   changed_when: false
   ignore_errors: yes
 
@@ -740,6 +741,7 @@
 # ===================== 18. AI MONITORING DASHBOARD =====================
 - name: Deploy AI Monitoring Dashboard as ConfigMap
   shell: |
+    {% raw %}
     cat <<'DASH_EOF' | kubectl apply -f -
     apiVersion: v1
     kind: ConfigMap
@@ -1250,6 +1252,7 @@
           "weekStart": ""
         }
     DASH_EOF
+    {% endraw %}
   become: yes
   become_user: ubuntu
   environment:
@@ -1264,10 +1267,10 @@
       ============================================================
       MONITORING STACK DEPLOYED SUCCESSFULLY
       ============================================================
-      Grafana:      http://{{ controller_ip }}:30080  (admin / admin123)
-      Prometheus:   http://{{ controller_ip }}:30090
-      AlertManager: http://{{ controller_ip }}:30093
-      Nginx Demo:   http://{{ controller_ip }}:30088
+      Grafana:      http://{{ ansible_default_ipv4.address }}:30080  (admin / admin123)
+      Prometheus:   http://{{ ansible_default_ipv4.address }}:30090
+      AlertManager: http://{{ ansible_default_ipv4.address }}:30093
+      Nginx Demo:   http://{{ ansible_default_ipv4.address }}:30088
       ============================================================
       Custom Alerts: HighCPUUsage, HighMemoryUsage, PodCrashLooping, HPAMaxedOut
       Dashboard:     AI Monitoring - Predictions et Anomalies
