@@ -1,34 +1,38 @@
 ---
 # =============================================================================
 # Role: kubernetes
-# Description: K8s cluster (controller=master, compute=worker)
-# Source: nouveau (pas de script shell existant)
-# Cible: controller (puis delegation au compute pour join)
+# Description: K8s cluster setup for Heat/cloud-init deployment
+# Variables from master.yml: node_role, master_ip, pod_network_cidr,
+#   k8s_version, token, calico_version, use_cinder, storage_path
 # =============================================================================
 
-# --- 1. Prerequisites sur controller ET compute ---
-- name: Desactiver le swap
+# ======================= COMMON TASKS (all nodes) =======================
+
+# --- 1. Disable Swap ---
+- name: Disable swap
   shell: swapoff -a
   changed_when: false
 
-- name: Supprimer swap du fstab
+- name: Remove swap from fstab
   lineinfile:
     path: /etc/fstab
     regexp: '\sswap\s'
     state: absent
 
-- name: Charger les modules kernel necessaires
+# --- 2. Kernel Modules ---
+- name: Configure kernel modules for K8s
   copy:
     dest: /etc/modules-load.d/k8s.conf
     content: |
       overlay
       br_netfilter
 
-- name: Charger les modules maintenant
+- name: Load kernel modules now
   shell: modprobe overlay && modprobe br_netfilter
   changed_when: false
 
-- name: Configurer sysctl pour K8s
+# --- 3. Sysctl ---
+- name: Configure sysctl for K8s networking
   copy:
     dest: /etc/sysctl.d/k8s.conf
     content: |
@@ -36,98 +40,58 @@
       net.bridge.bridge-nf-call-ip6tables = 1
       net.ipv4.ip_forward                 = 1
 
-- name: Appliquer sysctl
+- name: Apply sysctl settings
   shell: sysctl --system
   changed_when: false
 
-# --- 2. Repository Kubernetes ---
-- name: Ajouter la cle GPG Kubernetes
-  shell: |
-    curl -fsSL https://pkgs.k8s.io/core:/stable:/v{{ k8s_version }}/deb/Release.key | \
-    gpg --dearmor -o /usr/share/keyrings/kubernetes-apt-keyring.gpg
-  args:
-    creates: /usr/share/keyrings/kubernetes-apt-keyring.gpg
-
-- name: Ajouter le repository Kubernetes
-  copy:
-    dest: /etc/apt/sources.list.d/kubernetes.list
-    content: |
-      deb [signed-by=/usr/share/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v{{ k8s_version }}/deb/ /
-
-- name: Mettre a jour apt cache
+# --- 4. Install containerd (CRI runtime) ---
+- name: Install containerd package
   apt:
-    update_cache: yes
-
-# --- 3. Installation K8s ---
-- name: Installer kubelet kubeadm kubectl et iptables
-  apt:
-    name:
-      - kubelet
-      - kubeadm
-      - kubectl
-      - iptables
+    name: containerd
     state: present
+    update_cache: yes
+  retries: 5
+  delay: 15
+  register: containerd_install
+  until: containerd_install is succeeded
 
-- name: Verrouiller les versions K8s
-  shell: apt-mark hold kubelet kubeadm kubectl
+- name: Create containerd config directory
+  file:
+    path: /etc/containerd
+    state: directory
+
+- name: Generate default containerd config
+  shell: containerd config default > /etc/containerd/config.toml
   changed_when: false
 
-# --- 4. Prerequisites sur compute (delegue) ---
-- name: Desactiver swap sur compute
-  shell: swapoff -a
-  delegate_to: compute
-  changed_when: false
+- name: Enable SystemdCgroup in containerd
+  replace:
+    path: /etc/containerd/config.toml
+    regexp: 'SystemdCgroup = false'
+    replace: 'SystemdCgroup = true'
 
-- name: Supprimer swap du fstab sur compute
-  lineinfile:
-    path: /etc/fstab
-    regexp: '\sswap\s'
-    state: absent
-  delegate_to: compute
+- name: Restart and enable containerd
+  systemd:
+    name: containerd
+    state: restarted
+    enabled: yes
 
-- name: Modules kernel sur compute
-  copy:
-    dest: /etc/modules-load.d/k8s.conf
-    content: |
-      overlay
-      br_netfilter
-  delegate_to: compute
-
-- name: Charger modules sur compute
-  shell: modprobe overlay && modprobe br_netfilter
-  delegate_to: compute
-  changed_when: false
-
-- name: Sysctl sur compute
-  copy:
-    dest: /etc/sysctl.d/k8s.conf
-    content: |
-      net.bridge.bridge-nf-call-iptables  = 1
-      net.bridge.bridge-nf-call-ip6tables = 1
-      net.ipv4.ip_forward                 = 1
-  delegate_to: compute
-
-- name: Appliquer sysctl sur compute
-  shell: sysctl --system
-  delegate_to: compute
-  changed_when: false
-
-- name: Cle GPG K8s sur compute
+# --- 5. Kubernetes Repository ---
+- name: Add Kubernetes GPG key
   shell: |
     curl -fsSL https://pkgs.k8s.io/core:/stable:/v{{ k8s_version }}/deb/Release.key | \
     gpg --dearmor -o /usr/share/keyrings/kubernetes-apt-keyring.gpg
   args:
     creates: /usr/share/keyrings/kubernetes-apt-keyring.gpg
-  delegate_to: compute
 
-- name: Repo K8s sur compute
+- name: Add Kubernetes apt repository
   copy:
     dest: /etc/apt/sources.list.d/kubernetes.list
     content: |
       deb [signed-by=/usr/share/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v{{ k8s_version }}/deb/ /
-  delegate_to: compute
 
-- name: Installer K8s et iptables sur compute
+# --- 6. Install K8s Packages ---
+- name: Install kubelet kubeadm kubectl iptables
   apt:
     name:
       - kubelet
@@ -136,51 +100,204 @@
       - iptables
     state: present
     update_cache: yes
-  delegate_to: compute
+  retries: 5
+  delay: 15
+  register: k8s_install
+  until: k8s_install is succeeded
 
-- name: Verrouiller versions K8s sur compute
+- name: Hold K8s package versions
   shell: apt-mark hold kubelet kubeadm kubectl
-  delegate_to: compute
   changed_when: false
 
-# --- 5. Initialiser le Master (controller) ---
-- name: Verifier si le cluster est deja initialise
+# ======================= MASTER-ONLY TASKS =======================
+
+# --- 7. Initialize Kubernetes Cluster ---
+- name: Check if cluster is already initialized
   stat:
     path: /etc/kubernetes/admin.conf
   register: k8s_admin_conf
+  when: node_role | default('master') == "master"
 
-- name: Initialiser le cluster Kubernetes
+- name: Initialize Kubernetes cluster
   shell: |
     kubeadm init \
-      --apiserver-advertise-address={{ controller_ip }} \
-      --pod-network-cidr={{ k8s_pod_network_cidr }} \
+      --apiserver-advertise-address={{ ansible_default_ipv4.address }} \
+      --pod-network-cidr={{ pod_network_cidr | default('192.168.0.0/16') }} \
+      --token={{ token | default('abcdef.1234567890abcdef') }} \
       --ignore-preflight-errors=all
   register: kubeadm_init
-  when: not k8s_admin_conf.stat.exists
+  when:
+    - node_role | default('master') == "master"
+    - not k8s_admin_conf.stat.exists
 
-- name: Configurer kubectl pour root
+# --- 8. Configure kubectl ---
+- name: Configure kubectl for ubuntu user
+  shell: |
+    mkdir -p /home/ubuntu/.kube
+    cp -f /etc/kubernetes/admin.conf /home/ubuntu/.kube/config
+    chown -R ubuntu:ubuntu /home/ubuntu/.kube
+  when: node_role | default('master') == "master"
+  changed_when: false
+
+- name: Configure kubectl for root user
   shell: |
     mkdir -p /root/.kube
     cp -f /etc/kubernetes/admin.conf /root/.kube/config
-    chown root:root /root/.kube/config
+  when: node_role | default('master') == "master"
   changed_when: false
 
-# --- 6. Installer Flannel (CNI) ---
-- name: Installer Flannel CNI
-  shell: kubectl apply -f https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml
+# --- 9. Install Calico CNI ---
+- name: Install Calico tigera operator
+  shell: |
+    kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/{{ calico_version | default('v3.27.0') }}/manifests/tigera-operator.yaml 2>/dev/null || \
+    kubectl apply --server-side -f https://raw.githubusercontent.com/projectcalico/calico/{{ calico_version | default('v3.27.0') }}/manifests/tigera-operator.yaml
+  become_user: ubuntu
   environment:
-    KUBECONFIG: /etc/kubernetes/admin.conf
+    KUBECONFIG: /home/ubuntu/.kube/config
+  when: node_role | default('master') == "master"
+  retries: 3
+  delay: 15
+  register: calico_operator
+  until: calico_operator is succeeded
+  ignore_errors: yes
+
+- name: Wait for tigera operator to be ready
+  shell: |
+    kubectl -n tigera-operator rollout status deploy/tigera-operator --timeout=120s
+  become_user: ubuntu
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  when: node_role | default('master') == "master"
+  retries: 5
+  delay: 15
+  register: tigera_ready
+  until: tigera_ready is succeeded
   changed_when: false
   ignore_errors: yes
 
-# --- 7. Joindre le compute au cluster ---
-- name: Generer la commande join
-  shell: kubeadm token create --print-join-command
+- name: Apply Calico custom resources
+  shell: |
+    cat <<'CALICO_EOF' | kubectl apply -f -
+    apiVersion: operator.tigera.io/v1
+    kind: Installation
+    metadata:
+      name: default
+    spec:
+      calicoNetwork:
+        ipPools:
+        - blockSize: 26
+          cidr: {{ pod_network_cidr | default('192.168.0.0/16') }}
+          encapsulation: VXLANCrossSubnet
+          natOutgoing: Enabled
+          nodeSelector: all()
+    ---
+    apiVersion: operator.tigera.io/v1
+    kind: APIServer
+    metadata:
+      name: default
+    spec: {}
+    CALICO_EOF
+  become_user: ubuntu
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  when: node_role | default('master') == "master"
+  retries: 5
+  delay: 20
+  register: calico_cr
+  until: calico_cr is succeeded
+  ignore_errors: yes
+
+# --- 10. Wait for cluster nodes to be Ready ---
+- name: Wait for master node to be Ready
+  shell: kubectl get nodes --no-headers | grep -c ' Ready'
+  become_user: ubuntu
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  register: nodes_ready
+  until: nodes_ready.stdout | int >= 1
+  retries: 30
+  delay: 15
+  changed_when: false
+  when: node_role | default('master') == "master"
+
+# --- 11. Generate and serve join command ---
+- name: Generate join command file
+  shell: |
+    kubeadm token create --print-join-command > /home/ubuntu/join-command.sh
+    chmod 644 /home/ubuntu/join-command.sh
+    chown ubuntu:ubuntu /home/ubuntu/join-command.sh
+  when: node_role | default('master') == "master"
+  changed_when: false
+
+- name: Start HTTP server for join command distribution
+  shell: |
+    nohup python3 -m http.server 8000 --directory /home/ubuntu &>/dev/null &
+    disown
+  when: node_role | default('master') == "master"
+  changed_when: false
+  ignore_errors: yes
+
+- name: Display master setup summary
+  debug:
+    msg: |
+      ============================================================
+      KUBERNETES MASTER INITIALIZED
+      ============================================================
+      API Server: {{ ansible_default_ipv4.address }}:6443
+      Pod Network: {{ pod_network_cidr | default('192.168.0.0/16') }}
+      CNI: Calico {{ calico_version | default('v3.27.0') }}
+      Join command served on: http://{{ ansible_default_ipv4.address }}:8000/join-command.sh
+      ============================================================
+  when: node_role | default('master') == "master"
+
+# ======================= WORKER-ONLY TASKS =======================
+
+# --- 12. Worker: Join Cluster ---
+- name: Check if already joined a cluster
+  stat:
+    path: /etc/kubernetes/kubelet.conf
+  register: kubelet_conf
+  when: node_role | default('master') == "worker"
+
+- name: Retrieve join command from master HTTP server
+  shell: |
+    for i in $(seq 1 30); do
+      JOIN_CMD=$(curl -s --connect-timeout 5 http://{{ master_ip }}:8000/join-command.sh 2>/dev/null)
+      if echo "$JOIN_CMD" | grep -q "kubeadm join"; then
+        echo "$JOIN_CMD"
+        exit 0
+      fi
+      sleep 10
+    done
+    # Fallback: use token with unsafe CA skip
+    echo "kubeadm join {{ master_ip }}:6443 --token {{ token | default('abcdef.1234567890abcdef') }} --discovery-token-unsafe-skip-ca-verification"
   register: join_command
+  when:
+    - node_role | default('master') == "worker"
+    - not kubelet_conf.stat.exists
   changed_when: false
 
-- name: Joindre le compute au cluster K8s
-  shell: "{{ join_command.stdout }} --ignore-preflight-errors=all"
-  delegate_to: compute
+- name: Join the Kubernetes cluster
+  shell: "{{ join_command.stdout_lines | last }} --ignore-preflight-errors=all"
+  when:
+    - node_role | default('master') == "worker"
+    - not kubelet_conf.stat.exists
+    - join_command is defined
+  retries: 3
+  delay: 30
+  register: join_result
+  until: join_result is succeeded
   ignore_errors: yes
-  changed_when: false
+
+- name: Display worker setup summary
+  debug:
+    msg: |
+      ============================================================
+      KUBERNETES WORKER JOINED
+      ============================================================
+      Master: {{ master_ip }}:6443
+      Join result: {{ join_result.rc | default('N/A') }}
+      ============================================================
+  when:
+    - node_role | default('master') == "worker"
+    - join_result is defined
