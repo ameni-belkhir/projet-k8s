@@ -1,128 +1,180 @@
 ---
-# Monitoring Role - Main Tasks with Cinder Volume Support
-# Deploys Prometheus, Grafana, and full monitoring stack on master node
-# Supports both Cinder partitioned volumes and local-path provisioner
+# =============================================================================
+# Role: monitoring
+# Description: Prometheus + Grafana via Helm on Kubernetes (kube-prometheus-stack)
+# Fixed version: handles Cinder/local storage, admission webhooks, TLS, HPA, etc.
+# Target: controller (k8s master node)
+# =============================================================================
 
-- name: Wait for all cluster nodes to be ready
+# ===================== STORAGE FACTS =====================
+- name: Check if using Cinder storage
+  set_fact:
+    using_cinder: "{{ use_cinder | default(false) }}"
+    cinder_storage_path: "{{ storage_path | default('/mnt/k8s-storage') }}"
+
+- name: Set storage class names based on backend
+  set_fact:
+    sc_grafana: "{{ 'manual-grafana' if using_cinder | bool else 'local-path' }}"
+    sc_prometheus: "{{ 'manual-prometheus' if using_cinder | bool else 'local-path' }}"
+    sc_alertmanager: "{{ 'manual-alertmanager' if using_cinder | bool else 'local-path' }}"
+
+# ===================== 1. WAIT FOR CLUSTER =====================
+- name: Wait for cluster nodes to be Ready
+  shell: kubectl get nodes --no-headers | grep -c ' Ready'
   become: yes
   become_user: ubuntu
-  shell: |
-    kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' | grep -c "True" || echo "0"
   environment:
     KUBECONFIG: /home/ubuntu/.kube/config
-  register: ready_nodes
-  until: ready_nodes.stdout|int >= 1
+  register: nodes_ready
+  until: nodes_ready.stdout | int >= 1
   retries: 30
   delay: 20
   changed_when: false
 
+# ===================== 2. WAIT FOR COREDNS =====================
 - name: Wait for CoreDNS pods to be ready
+  shell: kubectl -n kube-system get pods -l k8s-app=kube-dns -o jsonpath='{.items[*].status.conditions[?(@.type=="Ready")].status}' | grep -c True
   become: yes
   become_user: ubuntu
-  shell: |
-    kubectl wait --for=condition=Ready pods -l k8s-app=kube-dns -n kube-system --timeout=180s || true
   environment:
     KUBECONFIG: /home/ubuntu/.kube/config
-  retries: 2
-  delay: 20
-  ignore_errors: yes
+  register: coredns_ready
+  until: coredns_ready.stdout | int >= 1
+  retries: 30
+  delay: 10
   changed_when: false
 
+# ===================== 3. REMOVE CONTROL-PLANE TAINT =====================
+- name: Remove control-plane taint from master node
+  shell: kubectl taint nodes --all node-role.kubernetes.io/control-plane- || true
+  become: yes
+  become_user: ubuntu
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  changed_when: false
+  ignore_errors: yes
+
+# ===================== 4. INSTALL HELM =====================
 - name: Check if Helm is installed
-  shell: command -v helm
+  shell: which helm
+  become: yes
+  become_user: ubuntu
   register: helm_check
   changed_when: false
-  failed_when: false
+  ignore_errors: yes
 
 - name: Download and install Helm
   shell: |
     curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
   when: helm_check.rc != 0
+  register: helm_install
   retries: 3
   delay: 10
+  until: helm_install is succeeded
 
-- name: Verify Helm installation
-  shell: helm version --short
-  register: helm_version
-  changed_when: false
-
-- name: Display Helm version
-  debug:
-    var: helm_version.stdout
-
-- name: Add Prometheus Community Helm repository
-  become: yes
-  become_user: ubuntu
+# ===================== 5. ADD HELM REPO =====================
+- name: Add prometheus-community Helm repo
   shell: |
-    helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
-  environment:
-    KUBECONFIG: /home/ubuntu/.kube/config
-  changed_when: false
-  retries: 3
-  delay: 10
-
-- name: Update Helm repositories
-  become: yes
-  become_user: ubuntu
-  shell: |
+    helm repo add prometheus-community https://prometheus-community.github.io/helm-charts 2>/dev/null || true
     helm repo update
+  become: yes
+  become_user: ubuntu
   environment:
     KUBECONFIG: /home/ubuntu/.kube/config
   changed_when: false
   retries: 3
   delay: 10
+  register: helm_repo_add
+  until: helm_repo_add is succeeded
 
+# ===================== 6. CREATE MONITORING NAMESPACE =====================
 - name: Create monitoring namespace
+  shell: kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
   become: yes
   become_user: ubuntu
-  shell: |
-    kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
   environment:
     KUBECONFIG: /home/ubuntu/.kube/config
   changed_when: false
 
-- name: Check if using Cinder storage
-  set_fact:
-    using_cinder: "{{ use_cinder | default(false) }}"
-    cinder_storage_path: "{{ storage_path | default('/mnt/k8s-storage') }}"
-    storage_class_name: "{{ 'manual' if (use_cinder | default(false)) else 'local-path' }}"
-
-- name: Display storage configuration
-  debug:
-    msg:
-      - "Using Cinder: {{ using_cinder }}"
-      - "Storage Path: {{ cinder_storage_path }}"
-      - "StorageClass: {{ storage_class_name }}"
-
-# === CINDER STORAGE SETUP ===
-- name: Create Persistent Volumes for Cinder storage
+# ===================== 7. STORAGECLASSES (CINDER) =====================
+- name: Create StorageClass for Grafana (Cinder)
+  shell: |
+    cat <<'SC_EOF' | kubectl apply -f -
+    apiVersion: storage.k8s.io/v1
+    kind: StorageClass
+    metadata:
+      name: manual-grafana
+    provisioner: kubernetes.io/no-provisioner
+    volumeBindingMode: WaitForFirstConsumer
+    SC_EOF
   become: yes
   become_user: ubuntu
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  changed_when: false
+  when: using_cinder | bool
+
+- name: Create StorageClass for Prometheus (Cinder)
   shell: |
-    cat <<EOF | kubectl apply -f -
-    apiVersion: v1
-    kind: PersistentVolume
+    cat <<'SC_EOF' | kubectl apply -f -
+    apiVersion: storage.k8s.io/v1
+    kind: StorageClass
     metadata:
-      name: prometheus-pv
-    spec:
-      capacity:
-        storage: 15Gi
-      accessModes:
-        - ReadWriteOnce
-      persistentVolumeReclaimPolicy: Retain
-      storageClassName: manual
-      hostPath:
-        path: {{ cinder_storage_path }}/prometheus
-        type: DirectoryOrCreate
-      nodeAffinity:
-        required:
-          nodeSelectorTerms:
-          - matchExpressions:
-            - key: kubernetes.io/hostname
-              operator: In
-              values:
-              - k8s-master
-    ---
+      name: manual-prometheus
+    provisioner: kubernetes.io/no-provisioner
+    volumeBindingMode: WaitForFirstConsumer
+    SC_EOF
+  become: yes
+  become_user: ubuntu
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  changed_when: false
+  when: using_cinder | bool
+
+- name: Create StorageClass for AlertManager (Cinder)
+  shell: |
+    cat <<'SC_EOF' | kubectl apply -f -
+    apiVersion: storage.k8s.io/v1
+    kind: StorageClass
+    metadata:
+      name: manual-alertmanager
+    provisioner: kubernetes.io/no-provisioner
+    volumeBindingMode: WaitForFirstConsumer
+    SC_EOF
+  become: yes
+  become_user: ubuntu
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  changed_when: false
+  when: using_cinder | bool
+
+# ===================== 8. PERSISTENT VOLUMES (CINDER) =====================
+- name: Create storage directories for PVs
+  file:
+    path: "{{ cinder_storage_path }}/{{ item }}"
+    state: directory
+    owner: ubuntu
+    group: ubuntu
+    mode: '0777'
+  loop:
+    - grafana
+    - prometheus
+    - alertmanager
+  when: using_cinder | bool
+
+- name: Get master node name
+  shell: kubectl get nodes -l node-role.kubernetes.io/control-plane -o jsonpath='{.items[0].metadata.name}'
+  become: yes
+  become_user: ubuntu
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  register: master_node_name
+  changed_when: false
+  when: using_cinder | bool
+
+- name: Create PersistentVolume for Grafana (5Gi)
+  shell: |
+    cat <<PV_EOF | kubectl apply -f -
     apiVersion: v1
     kind: PersistentVolume
     metadata:
@@ -133,19 +185,62 @@
       accessModes:
         - ReadWriteOnce
       persistentVolumeReclaimPolicy: Retain
-      storageClassName: manual
+      storageClassName: manual-grafana
       hostPath:
         path: {{ cinder_storage_path }}/grafana
         type: DirectoryOrCreate
       nodeAffinity:
         required:
           nodeSelectorTerms:
-          - matchExpressions:
-            - key: kubernetes.io/hostname
-              operator: In
-              values:
-              - k8s-master
-    ---
+            - matchExpressions:
+                - key: kubernetes.io/hostname
+                  operator: In
+                  values:
+                    - {{ master_node_name.stdout | default('k8s-master') }}
+    PV_EOF
+  become: yes
+  become_user: ubuntu
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  changed_when: false
+  when: using_cinder | bool
+
+- name: Create PersistentVolume for Prometheus (15Gi)
+  shell: |
+    cat <<PV_EOF | kubectl apply -f -
+    apiVersion: v1
+    kind: PersistentVolume
+    metadata:
+      name: prometheus-pv
+    spec:
+      capacity:
+        storage: 15Gi
+      accessModes:
+        - ReadWriteOnce
+      persistentVolumeReclaimPolicy: Retain
+      storageClassName: manual-prometheus
+      hostPath:
+        path: {{ cinder_storage_path }}/prometheus
+        type: DirectoryOrCreate
+      nodeAffinity:
+        required:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: kubernetes.io/hostname
+                  operator: In
+                  values:
+                    - {{ master_node_name.stdout | default('k8s-master') }}
+    PV_EOF
+  become: yes
+  become_user: ubuntu
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  changed_when: false
+  when: using_cinder | bool
+
+- name: Create PersistentVolume for AlertManager (5Gi)
+  shell: |
+    cat <<PV_EOF | kubectl apply -f -
     apiVersion: v1
     kind: PersistentVolume
     metadata:
@@ -156,382 +251,315 @@
       accessModes:
         - ReadWriteOnce
       persistentVolumeReclaimPolicy: Retain
-      storageClassName: manual
+      storageClassName: manual-alertmanager
       hostPath:
         path: {{ cinder_storage_path }}/alertmanager
         type: DirectoryOrCreate
       nodeAffinity:
         required:
           nodeSelectorTerms:
-          - matchExpressions:
-            - key: kubernetes.io/hostname
-              operator: In
-              values:
-              - k8s-master
-    EOF
+            - matchExpressions:
+                - key: kubernetes.io/hostname
+                  operator: In
+                  values:
+                    - {{ master_node_name.stdout | default('k8s-master') }}
+    PV_EOF
+  become: yes
+  become_user: ubuntu
   environment:
     KUBECONFIG: /home/ubuntu/.kube/config
+  changed_when: false
   when: using_cinder | bool
+
+# ===================== 9. TLS ADMISSION SECRET =====================
+- name: Generate self-signed TLS certificate for admission webhooks
+  shell: |
+    cd /tmp
+    openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
+      -keyout /tmp/admission-tls.key \
+      -out /tmp/admission-tls.crt \
+      -subj "/CN=prometheus-kube-prometheus-admission.monitoring.svc" \
+      -addext "subjectAltName=DNS:prometheus-kube-prometheus-admission.monitoring.svc,DNS:prometheus-kube-prometheus-admission.monitoring.svc.cluster.local"
+  become: yes
+  become_user: ubuntu
   changed_when: false
 
-# === LOCAL-PATH PROVISIONER SETUP (fallback) ===
-- name: Check if local-path storage provisioner exists
+- name: Create TLS admission secret in monitoring namespace
+  shell: |
+    kubectl -n monitoring delete secret admission-tls 2>/dev/null || true
+    kubectl -n monitoring create secret generic admission-tls \
+      --from-file=cert=/tmp/admission-tls.crt \
+      --from-file=key=/tmp/admission-tls.key \
+      --from-file=ca=/tmp/admission-tls.crt
   become: yes
   become_user: ubuntu
-  shell: |
-    kubectl get deployment -n local-path-storage local-path-provisioner 2>/dev/null || echo "not_found"
   environment:
     KUBECONFIG: /home/ubuntu/.kube/config
-  register: storage_check
   changed_when: false
-  when: not (using_cinder | bool)
 
-- name: Install local-path storage provisioner
-  become: yes
-  become_user: ubuntu
-  shell: |
-    kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.28/deploy/local-path-storage.yaml
-  environment:
-    KUBECONFIG: /home/ubuntu/.kube/config
-  when:
-    - not (using_cinder | bool)
-    - "'not_found' in storage_check.stdout"
-  retries: 3
-  delay: 10
-
-- name: Wait for local-path-provisioner to be ready
-  become: yes
-  become_user: ubuntu
-  shell: |
-    kubectl wait --for=condition=Ready pod -l app=local-path-provisioner -n local-path-storage --timeout=120s
-  environment:
-    KUBECONFIG: /home/ubuntu/.kube/config
-  when:
-    - not (using_cinder | bool)
-    - "'not_found' in storage_check.stdout"
-  retries: 2
-  delay: 10
-  ignore_errors: yes
-
-- name: Set local-path as default StorageClass
-  become: yes
-  become_user: ubuntu
-  shell: |
-    kubectl patch storageclass local-path -p '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
-  environment:
-    KUBECONFIG: /home/ubuntu/.kube/config
-  when:
-    - not (using_cinder | bool)
-    - "'not_found' in storage_check.stdout"
-  changed_when: false
-  ignore_errors: yes
-
-# === PROMETHEUS HELM VALUES ===
-- name: Create custom values file for Prometheus stack
+# ===================== 10. HELM VALUES FILE =====================
+- name: Generate kube-prometheus-stack Helm values file
   copy:
-    dest: /tmp/prometheus-values.yaml
-    content: |
-      # Prometheus Operator Configuration
-      prometheusOperator:
-        resources:
-          limits:
-            cpu: 200m
-            memory: 256Mi
-          requests:
-            cpu: 100m
-            memory: 128Mi
-      
-      # Prometheus Configuration
-      prometheus:
-        prometheusSpec:
-          retention: 7d
-          resources:
-            requests:
-              cpu: 200m
-              memory: 512Mi
-            limits:
-              cpu: 500m
-              memory: 1Gi
-          storageSpec:
-            volumeClaimTemplate:
-              spec:
-                storageClassName: {{ storage_class_name }}
-                accessModes: ["ReadWriteOnce"]
-                resources:
-                  requests:
-                    storage: 10Gi
-      
-      # Grafana Configuration
-      grafana:
-        enabled: true
-        adminPassword: admin
-        service:
-          type: NodePort
-          nodePort: 30080
-        resources:
-          limits:
-            cpu: 200m
-            memory: 256Mi
-          requests:
-            cpu: 100m
-            memory: 128Mi
-        persistence:
-          enabled: true
-          storageClassName: {{ storage_class_name }}
-          size: 4Gi
-      
-      # AlertManager Configuration
-      alertmanager:
-        alertmanagerSpec:
-          retention: 120h
-          resources:
-            requests:
-              cpu: 100m
-              memory: 128Mi
-            limits:
-              cpu: 200m
-              memory: 256Mi
-          storage:
-            volumeClaimTemplate:
-              spec:
-                storageClassName: {{ storage_class_name }}
-                accessModes: ["ReadWriteOnce"]
-                resources:
-                  requests:
-                    storage: 4Gi
-      
-      # Node Exporter Configuration
-      nodeExporter:
-        enabled: true
-      
-      # Kube State Metrics Configuration
-      kubeStateMetrics:
-        enabled: true
-      
-      # Disable components not needed in small clusters
-      kubeControllerManager:
-        enabled: false
-      kubeScheduler:
-        enabled: false
-      kubeProxy:
-        enabled: true
-      kubeEtcd:
-        enabled: false
+    dest: /home/ubuntu/prometheus-values.yaml
     owner: ubuntu
     group: ubuntu
     mode: '0644'
+    content: |
+      # =============================================================
+      # kube-prometheus-stack Helm values - Generated by Ansible
+      # =============================================================
 
-- name: Check if Prometheus stack is already installed
-  become: yes
-  become_user: ubuntu
-  shell: |
-    helm list -n monitoring | grep prometheus || echo "not_installed"
-  environment:
-    KUBECONFIG: /home/ubuntu/.kube/config
-  register: prometheus_installed
-  changed_when: false
+      # --- Admission Webhooks: DISABLED to avoid cert-manager dependency ---
+      prometheusOperator:
+        admissionWebhooks:
+          enabled: false
+          patch:
+            enabled: false
+        tls:
+          enabled: false
 
-- name: Install Prometheus Stack using Helm
-  become: yes
-  become_user: ubuntu
+      # --- Grafana ---
+      grafana:
+        enabled: true
+        adminPassword: "admin123"
+        service:
+          type: NodePort
+          nodePort: 30080
+        persistence:
+          enabled: true
+          size: 5Gi
+          storageClassName: "{{ sc_grafana }}"
+        sidecar:
+          dashboards:
+            enabled: true
+            label: grafana_dashboard
+            labelValue: "1"
+            searchNamespace: ALL
+
+      # --- Prometheus ---
+      prometheus:
+        prometheusSpec:
+          replicas: 1
+          retention: 15d
+          storageSpec:
+            volumeClaimTemplate:
+              spec:
+                storageClassName: "{{ sc_prometheus }}"
+                accessModes: ["ReadWriteOnce"]
+                resources:
+                  requests:
+                    storage: 15Gi
+          ruleSelectorNilUsesHelmValues: false
+          ruleSelector: {}
+          ruleNamespaceSelector: {}
+          serviceMonitorSelectorNilUsesHelmValues: false
+          serviceMonitorSelector: {}
+          serviceMonitorNamespaceSelector: {}
+          podMonitorSelectorNilUsesHelmValues: false
+          podMonitorSelector: {}
+          podMonitorNamespaceSelector: {}
+        service:
+          type: ClusterIP
+
+      # --- AlertManager ---
+      alertmanager:
+        alertmanagerSpec:
+          replicas: 1
+          storage:
+            volumeClaimTemplate:
+              spec:
+                storageClassName: "{{ sc_alertmanager }}"
+                accessModes: ["ReadWriteOnce"]
+                resources:
+                  requests:
+                    storage: 5Gi
+        service:
+          type: ClusterIP
+
+      # --- Disable components that cause issues in lab ---
+      kubeEtcd:
+        enabled: false
+      kubeScheduler:
+        enabled: false
+      kubeControllerManager:
+        enabled: false
+      kubeProxy:
+        enabled: false
+
+      # --- Node Exporter ---
+      nodeExporter:
+        enabled: true
+      prometheus-node-exporter:
+        hostRootFsMount:
+          enabled: true
+
+      # --- Kube State Metrics ---
+      kubeStateMetrics:
+        enabled: true
+
+# ===================== 11. HELM INSTALL KUBE-PROMETHEUS-STACK =====================
+- name: Install kube-prometheus-stack via Helm
   shell: |
     helm upgrade --install prometheus prometheus-community/kube-prometheus-stack \
       --namespace monitoring \
-      --create-namespace \
-      --values /tmp/prometheus-values.yaml \
+      --values /home/ubuntu/prometheus-values.yaml \
+      --no-hooks \
       --wait \
-      --timeout 20m
-  environment:
-    KUBECONFIG: /home/ubuntu/.kube/config
-  when: "'not_installed' in prometheus_installed.stdout"
-  register: helm_install
-  async: 1800
-  poll: 10
-  retries: 2
-  delay: 30
-  ignore_errors: yes
-
-- name: Wait for Prometheus Operator to be ready
+      --timeout 20m \
+      --version 65.1.0 2>&1
   become: yes
   become_user: ubuntu
-  shell: |
-    kubectl wait --for=condition=Available --timeout=600s deployment/prometheus-kube-prometheus-operator -n monitoring
   environment:
     KUBECONFIG: /home/ubuntu/.kube/config
+  register: helm_install_result
   retries: 3
   delay: 30
+  until: helm_install_result is succeeded
+
+- name: Display Helm install result
+  debug:
+    var: helm_install_result.stdout_lines
+  when: helm_install_result is defined
+
+# ===================== 12. WAIT FOR PODS =====================
+- name: Wait for Prometheus operator pod to be ready
+  shell: |
+    kubectl -n monitoring get pods -l app.kubernetes.io/name=prometheus-operator \
+      -o jsonpath='{.items[0].status.conditions[?(@.type=="Ready")].status}'
+  become: yes
+  become_user: ubuntu
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  register: operator_ready
+  until: operator_ready.stdout == "True"
+  retries: 30
+  delay: 15
+  changed_when: false
   ignore_errors: yes
 
 - name: Wait for Prometheus pods to be ready
+  shell: |
+    kubectl -n monitoring get pods -l app.kubernetes.io/name=prometheus \
+      --field-selector=status.phase=Running --no-headers | wc -l
   become: yes
   become_user: ubuntu
-  shell: |
-    kubectl wait --for=condition=Ready --timeout=600s pods -l app.kubernetes.io/name=prometheus -n monitoring
   environment:
     KUBECONFIG: /home/ubuntu/.kube/config
-  retries: 3
-  delay: 30
+  register: prometheus_pods
+  until: prometheus_pods.stdout | int >= 1
+  retries: 30
+  delay: 15
+  changed_when: false
   ignore_errors: yes
 
 - name: Wait for Grafana pods to be ready
+  shell: |
+    kubectl -n monitoring get pods -l app.kubernetes.io/name=grafana \
+      -o jsonpath='{.items[0].status.conditions[?(@.type=="Ready")].status}'
   become: yes
   become_user: ubuntu
-  shell: |
-    kubectl wait --for=condition=Ready --timeout=600s pods -l app.kubernetes.io/name=grafana -n monitoring
   environment:
     KUBECONFIG: /home/ubuntu/.kube/config
-  retries: 3
-  delay: 30
+  register: grafana_ready
+  until: grafana_ready.stdout == "True"
+  retries: 30
+  delay: 15
+  changed_when: false
   ignore_errors: yes
 
-- name: Get Grafana admin password
+# ===================== 13. EXPOSE PROMETHEUS & ALERTMANAGER =====================
+- name: Expose Prometheus as NodePort 30090
+  shell: |
+    kubectl -n monitoring patch svc prometheus-kube-prometheus-prometheus \
+      -p '{"spec": {"type": "NodePort", "ports": [{"port": 9090, "targetPort": 9090, "nodePort": 30090, "protocol": "TCP", "name": "http-web"}]}}'
   become: yes
   become_user: ubuntu
-  shell: |
-    kubectl get secret -n monitoring prometheus-grafana -o jsonpath="{.data.admin-password}" | base64 --decode
-  environment:
-    KUBECONFIG: /home/ubuntu/.kube/config
-  register: grafana_password
-  changed_when: false
-
-- name: Get Grafana service details
-  become: yes
-  become_user: ubuntu
-  shell: |
-    kubectl get svc -n monitoring prometheus-grafana -o jsonpath='{.spec.type}:{.spec.ports[0].nodePort}'
-  environment:
-    KUBECONFIG: /home/ubuntu/.kube/config
-  register: grafana_service
-  changed_when: false
-
-- name: Get Prometheus service details
-  become: yes
-  become_user: ubuntu
-  shell: |
-    kubectl get svc -n monitoring prometheus-kube-prometheus-prometheus
-  environment:
-    KUBECONFIG: /home/ubuntu/.kube/config
-  register: prometheus_service
-  changed_when: false
-
-- name: Display monitoring stack information
-  debug:
-    msg:
-      - "========================================="
-      - "Monitoring Stack Deployment Complete!"
-      - "========================================="
-      - "Storage Type: {{ 'Cinder Partitioned' if using_cinder else 'Local-Path' }}"
-      - "Storage Class: {{ storage_class_name }}"
-      - ""
-      - "Grafana Access:"
-      - "  - Service Type: {{ grafana_service.stdout.split(':')[0] }}"
-      - "  - NodePort: {{ grafana_service.stdout.split(':')[1] }}"
-      - "  - Username: admin"
-      - "  - Password: {{ grafana_password.stdout }}"
-      - ""
-      - "Access Grafana:"
-      - "  kubectl port-forward -n monitoring svc/prometheus-grafana 3000:80"
-      - "  Then browse to: http://localhost:3000"
-      - ""
-      - "Access Prometheus:"
-      - "  kubectl port-forward -n monitoring svc/prometheus-kube-prometheus-prometheus 9090:9090"
-      - "  Then browse to: http://localhost:9090"
-      - ""
-      - "View all monitoring pods:"
-      - "  kubectl get pods -n monitoring"
-      - "========================================="
-
-- name: Create monitoring dashboard ConfigMap
-  become: yes
-  become_user: ubuntu
-  shell: |
-    kubectl create configmap monitoring-info -n monitoring \
-      --from-literal=grafana-password="{{ grafana_password.stdout }}" \
-      --from-literal=storage-type="{{ 'Cinder' if using_cinder else 'Local-Path' }}" \
-      --from-literal=access-info="Port-forward with: kubectl port-forward -n monitoring svc/prometheus-grafana 3000:80" \
-      --dry-run=client -o yaml | kubectl apply -f -
   environment:
     KUBECONFIG: /home/ubuntu/.kube/config
   changed_when: false
+  ignore_errors: yes
 
-- name: Verify all monitoring components are running
+- name: Expose AlertManager as NodePort 30093
+  shell: |
+    kubectl -n monitoring patch svc prometheus-kube-prometheus-alertmanager \
+      -p '{"spec": {"type": "NodePort", "ports": [{"port": 9093, "targetPort": 9093, "nodePort": 30093, "protocol": "TCP", "name": "http-web"}]}}'
   become: yes
   become_user: ubuntu
-  shell: |
-    kubectl get pods -n monitoring -o wide
   environment:
     KUBECONFIG: /home/ubuntu/.kube/config
-  register: monitoring_pods
   changed_when: false
+  ignore_errors: yes
 
-- name: Display monitoring pods status
-  debug:
-    var: monitoring_pods.stdout_lines
-
-- name: Display storage information (Cinder only)
+# ===================== 14. METRICS SERVER =====================
+- name: Check if metrics-server is already installed
+  shell: kubectl -n kube-system get deployment metrics-server --no-headers 2>/dev/null | wc -l
   become: yes
   become_user: ubuntu
-  shell: |
-    kubectl get pv,pvc -n monitoring
-  environment:
-    KUBECONFIG: /home/ubuntu/.kube/config
-  register: storage_info
-  changed_when: false
-  when: using_cinder | bool
-
-- name: Show storage details
-  debug:
-    var: storage_info.stdout_lines
-  when: using_cinder | bool
-
-# === METRICS SERVER (required for HPA) ===
-- name: Check if metrics-server is installed
-  become: yes
-  become_user: ubuntu
-  shell: |
-    kubectl get deployment metrics-server -n kube-system 2>/dev/null && echo 'installed' || echo 'not_installed'
   environment:
     KUBECONFIG: /home/ubuntu/.kube/config
   register: metrics_server_check
   changed_when: false
+  ignore_errors: yes
 
-- name: Install metrics-server
+- name: Install metrics-server v0.7.2
+  shell: |
+    kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/download/v0.7.2/components.yaml
   become: yes
   become_user: ubuntu
-  shell: |
-    kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
-    sleep 5
-    kubectl patch deployment metrics-server -n kube-system --type='json' \
-      -p='[{"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--kubelet-insecure-tls"}]'
   environment:
     KUBECONFIG: /home/ubuntu/.kube/config
-  when: "'not_installed' in metrics_server_check.stdout"
+  when: metrics_server_check.stdout | int == 0
+  register: metrics_install
   retries: 3
   delay: 10
+  until: metrics_install is succeeded
+
+- name: Patch metrics-server for insecure TLS and preferred address types
+  shell: |
+    kubectl -n kube-system patch deployment metrics-server --type=json -p='[
+      {
+        "op": "replace",
+        "path": "/spec/template/spec/containers/0/args",
+        "value": [
+          "--cert-dir=/tmp",
+          "--secure-port=10250",
+          "--kubelet-insecure-tls",
+          "--kubelet-preferred-address-types=InternalIP,ExternalIP,Hostname",
+          "--kubelet-use-node-status-port",
+          "--metric-resolution=15s"
+        ]
+      }
+    ]'
+  become: yes
+  become_user: ubuntu
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  changed_when: false
   ignore_errors: yes
 
 - name: Wait for metrics-server to be ready
+  shell: kubectl -n kube-system rollout status deployment metrics-server --timeout=120s
   become: yes
   become_user: ubuntu
-  shell: |
-    kubectl wait --for=condition=Available --timeout=120s deployment/metrics-server -n kube-system
   environment:
     KUBECONFIG: /home/ubuntu/.kube/config
+  changed_when: false
   retries: 3
   delay: 15
+  register: metrics_rollout
+  until: metrics_rollout is succeeded
   ignore_errors: yes
 
-# === HPA DEMO (Horizontal Pod Autoscaler) ===
-- name: Deploy HPA demo application (php-apache)
-  become: yes
-  become_user: ubuntu
+# ===================== 15. HPA DEMO =====================
+- name: Deploy HPA demo (php-apache deployment + service + HPA)
   shell: |
-    cat <<EOF | kubectl apply -f -
+    cat <<'HPA_EOF' | kubectl apply -f -
+    ---
     apiVersion: apps/v1
     kind: Deployment
     metadata:
       name: php-apache
-      namespace: default
+      namespace: monitoring
     spec:
       replicas: 1
       selector:
@@ -543,32 +571,33 @@
             app: php-apache
         spec:
           containers:
-          - name: php-apache
-            image: registry.k8s.io/hpa-example
-            ports:
-            - containerPort: 80
-            resources:
-              requests:
-                cpu: 200m
-              limits:
-                cpu: 500m
+            - name: php-apache
+              image: registry.k8s.io/hpa-example
+              ports:
+                - containerPort: 80
+              resources:
+                requests:
+                  cpu: 200m
+                limits:
+                  cpu: 500m
     ---
     apiVersion: v1
     kind: Service
     metadata:
       name: php-apache
-      namespace: default
+      namespace: monitoring
     spec:
-      ports:
-      - port: 80
       selector:
         app: php-apache
+      ports:
+        - port: 80
+          targetPort: 80
     ---
     apiVersion: autoscaling/v2
     kind: HorizontalPodAutoscaler
     metadata:
-      name: php-apache-hpa
-      namespace: default
+      name: php-apache
+      namespace: monitoring
     spec:
       scaleTargetRef:
         apiVersion: apps/v1
@@ -577,74 +606,78 @@
       minReplicas: 1
       maxReplicas: 10
       metrics:
-      - type: Resource
-        resource:
-          name: cpu
-          target:
-            type: Utilization
-            averageUtilization: 50
-    EOF
+        - type: Resource
+          resource:
+            name: cpu
+            target:
+              type: Utilization
+              averageUtilization: 50
+    HPA_EOF
+  become: yes
+  become_user: ubuntu
   environment:
     KUBECONFIG: /home/ubuntu/.kube/config
   changed_when: false
+  ignore_errors: yes
 
-# === NGINX DEMO APP ===
-- name: Deploy nginx demo application
-  become: yes
-  become_user: ubuntu
+# ===================== 16. NGINX DEMO =====================
+- name: Deploy nginx demo (2 replicas, NodePort 30088)
   shell: |
-    cat <<EOF | kubectl apply -f -
+    cat <<'NGINX_EOF' | kubectl apply -f -
+    ---
     apiVersion: apps/v1
     kind: Deployment
     metadata:
-      name: nginx
-      namespace: default
+      name: nginx-demo
+      namespace: monitoring
     spec:
       replicas: 2
       selector:
         matchLabels:
-          app: nginx
+          app: nginx-demo
       template:
         metadata:
           labels:
-            app: nginx
+            app: nginx-demo
         spec:
           containers:
-          - name: nginx
-            image: nginx:latest
-            ports:
-            - containerPort: 80
-            resources:
-              requests:
-                cpu: 50m
-                memory: 64Mi
-              limits:
-                cpu: 100m
-                memory: 128Mi
+            - name: nginx
+              image: nginx:stable
+              ports:
+                - containerPort: 80
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  cpu: 100m
+                  memory: 128Mi
     ---
     apiVersion: v1
     kind: Service
     metadata:
-      name: nginx
-      namespace: default
+      name: nginx-demo
+      namespace: monitoring
     spec:
       type: NodePort
-      ports:
-      - port: 80
-        nodePort: 30088
       selector:
-        app: nginx
-    EOF
+        app: nginx-demo
+      ports:
+        - port: 80
+          targetPort: 80
+          nodePort: 30088
+    NGINX_EOF
+  become: yes
+  become_user: ubuntu
   environment:
     KUBECONFIG: /home/ubuntu/.kube/config
   changed_when: false
+  ignore_errors: yes
 
-# === ALERT RULES FOR DEMO ===
+# ===================== 17. CUSTOM PROMETHEUS RULES =====================
 - name: Deploy custom PrometheusRule alerts
-  become: yes
-  become_user: ubuntu
   shell: |
-    cat <<'EOF' | kubectl apply -f -
+    cat <<'RULES_EOF' | kubectl apply -f -
     apiVersion: monitoring.coreos.com/v1
     kind: PrometheusRule
     metadata:
@@ -652,145 +685,592 @@
       namespace: monitoring
       labels:
         release: prometheus
+        app: kube-prometheus-stack
     spec:
       groups:
-      - name: custom.rules
-        rules:
-        - alert: HighCPUUsage
-          expr: 100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
-          for: 2m
-          labels:
-            severity: warning
-          annotations:
-            summary: "High CPU usage detected"
-            description: "CPU usage is above 80% for more than 2 minutes."
-        - alert: HighMemoryUsage
-          expr: (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > 85
-          for: 2m
-          labels:
-            severity: warning
-          annotations:
-            summary: "High memory usage detected"
-            description: "Memory usage is above 85% for more than 2 minutes."
-        - alert: PodCrashLooping
-          expr: rate(kube_pod_container_status_restarts_total[5m]) > 0
-          for: 5m
-          labels:
-            severity: critical
-          annotations:
-            summary: "Pod crash looping"
-            description: "A pod is crash looping."
-        - alert: HPAMaxedOut
-          expr: kube_horizontalpodautoscaler_status_current_replicas == kube_horizontalpodautoscaler_spec_max_replicas
-          for: 5m
-          labels:
-            severity: warning
-          annotations:
-            summary: "HPA at maximum replicas"
-            description: "HPA is running at max capacity."
-    EOF
-  environment:
-    KUBECONFIG: /home/ubuntu/.kube/config
-  changed_when: false
-  ignore_errors: yes
+        - name: custom-node-alerts
+          rules:
+            - alert: HighCPUUsage
+              expr: >
+                (1 - avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m]))) * 100 > 80
+              for: 5m
+              labels:
+                severity: warning
+              annotations:
+                summary: "High CPU usage detected on {{ "{{" }} $labels.instance {{ "}}" }}"
+                description: "CPU usage is above 80% (current value: {{ "{{" }} $value {{ "}}" }}%)"
 
-# === AI MONITORING GRAFANA DASHBOARD ===
-- name: Create AI monitoring dashboard JSON file
-  copy:
-    dest: /tmp/ai-dashboard.json
-    content: |
-      {
-        "annotations": {"list": []},
-        "editable": true,
-        "panels": [
-          {
-            "title": "AI Anomaly Score - CPU",
-            "type": "timeseries",
-            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
-            "targets": [{"expr": "abs(rate(node_cpu_seconds_total{mode=\"idle\"}[5m]) - avg_over_time(rate(node_cpu_seconds_total{mode=\"idle\"}[5m])[1h:])) / stddev_over_time(rate(node_cpu_seconds_total{mode=\"idle\"}[5m])[1h:])", "legendFormat": "Z-Score {{instance}}", "refId": "A"}],
-            "fieldConfig": {"defaults": {"thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 1.5}, {"color": "red", "value": 2.5}]}}}
-          },
-          {
-            "title": "AI Anomaly Score - Memory",
-            "type": "timeseries",
-            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
-            "targets": [{"expr": "abs((node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes) / node_memory_MemTotal_bytes - avg_over_time(((node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes) / node_memory_MemTotal_bytes)[1h:])) / stddev_over_time(((node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes) / node_memory_MemTotal_bytes)[1h:])", "legendFormat": "Z-Score {{instance}}", "refId": "A"}],
-            "fieldConfig": {"defaults": {"thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 1.5}, {"color": "red", "value": 2.5}]}}}
-          },
-          {
-            "title": "Pod Autoscaling Activity",
-            "type": "timeseries",
-            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
-            "targets": [
-              {"expr": "kube_horizontalpodautoscaler_status_current_replicas", "legendFormat": "Current {{horizontalpodautoscaler}}", "refId": "A"},
-              {"expr": "kube_horizontalpodautoscaler_status_desired_replicas", "legendFormat": "Desired {{horizontalpodautoscaler}}", "refId": "B"}
-            ]
-          },
-          {
-            "title": "Network Anomaly Detection",
-            "type": "timeseries",
-            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
-            "targets": [{"expr": "abs(rate(node_network_receive_bytes_total[5m]) - avg_over_time(rate(node_network_receive_bytes_total[5m])[1h:])) / (stddev_over_time(rate(node_network_receive_bytes_total[5m])[1h:]) > 0)", "legendFormat": "Z-Score {{instance}} {{device}}", "refId": "A"}],
-            "fieldConfig": {"defaults": {"thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 2}, {"color": "red", "value": 3}]}}}
-          },
-          {
-            "title": "Cluster Health Score (AI)",
-            "type": "gauge",
-            "gridPos": {"h": 8, "w": 8, "x": 0, "y": 16},
-            "targets": [{"expr": "100 - (count(ALERTS{alertstate=\"firing\"}) or vector(0)) * 10 - (count(kube_pod_status_phase{phase=\"Failed\"}) or vector(0)) * 5", "refId": "A"}],
-            "fieldConfig": {"defaults": {"min": 0, "max": 100, "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "yellow", "value": 50}, {"color": "green", "value": 80}]}}}
-          },
-          {
-            "title": "Predictive CPU Capacity",
-            "type": "timeseries",
-            "gridPos": {"h": 8, "w": 8, "x": 8, "y": 16},
-            "targets": [
-              {"expr": "1 - avg(rate(node_cpu_seconds_total{mode=\"idle\"}[5m]))", "legendFormat": "Current CPU", "refId": "A"},
-              {"expr": "predict_linear(avg(1 - rate(node_cpu_seconds_total{mode=\"idle\"}[5m]))[30m:1m], 3600)", "legendFormat": "Predicted (1h)", "refId": "B"}
-            ]
-          },
-          {
-            "title": "Active Alerts",
-            "type": "table",
-            "gridPos": {"h": 8, "w": 8, "x": 16, "y": 16},
-            "targets": [{"expr": "ALERTS{alertstate=\"firing\"}", "format": "table", "instant": true, "refId": "A"}]
-          }
-        ],
-        "schemaVersion": 38,
-        "tags": ["ai", "monitoring", "anomaly"],
-        "time": {"from": "now-1h", "to": "now"},
-        "title": "AI Monitoring & Anomaly Detection",
-        "uid": "ai-monitoring-dash"
-      }
-    owner: ubuntu
-    group: ubuntu
-    mode: '0644'
+            - alert: HighMemoryUsage
+              expr: >
+                (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > 85
+              for: 5m
+              labels:
+                severity: warning
+              annotations:
+                summary: "High memory usage detected on {{ "{{" }} $labels.instance {{ "}}" }}"
+                description: "Memory usage is above 85% (current value: {{ "{{" }} $value {{ "}}" }}%)"
 
-- name: Deploy AI monitoring dashboard ConfigMap
+            - alert: PodCrashLooping
+              expr: >
+                increase(kube_pod_container_status_restarts_total[15m]) > 3
+              for: 5m
+              labels:
+                severity: critical
+              annotations:
+                summary: "Pod {{ "{{" }} $labels.pod {{ "}}" }} is crash looping"
+                description: "Pod {{ "{{" }} $labels.pod {{ "}}" }} in namespace {{ "{{" }} $labels.namespace {{ "}}" }} has restarted more than 3 times in 15 minutes"
+
+            - alert: HPAMaxedOut
+              expr: >
+                kube_horizontalpodautoscaler_status_current_replicas == kube_horizontalpodautoscaler_spec_max_replicas
+              for: 10m
+              labels:
+                severity: warning
+              annotations:
+                summary: "HPA {{ "{{" }} $labels.horizontalpodautoscaler {{ "}}" }} is at max replicas"
+                description: "HPA {{ "{{" }} $labels.horizontalpodautoscaler {{ "}}" }} in namespace {{ "{{" }} $labels.namespace {{ "}}" }} has been at max replicas for over 10 minutes"
+    RULES_EOF
   become: yes
   become_user: ubuntu
-  shell: |
-    kubectl create configmap ai-monitoring-dashboard \
-      --namespace monitoring \
-      --from-file=ai-monitoring.json=/tmp/ai-dashboard.json \
-      --dry-run=client -o yaml | \
-    kubectl label --local -f - grafana_dashboard=1 -o yaml --dry-run=client | \
-    kubectl apply -f -
   environment:
     KUBECONFIG: /home/ubuntu/.kube/config
   changed_when: false
   ignore_errors: yes
 
-- name: Final deployment summary
+# ===================== 18. AI MONITORING DASHBOARD =====================
+- name: Deploy AI Monitoring Dashboard as ConfigMap
+  shell: |
+    cat <<'DASH_EOF' | kubectl apply -f -
+    apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: ai-monitoring-dashboard
+      namespace: monitoring
+      labels:
+        grafana_dashboard: "1"
+    data:
+      ai-monitoring-dashboard.json: |
+        {
+          "annotations": { "list": [] },
+          "editable": true,
+          "fiscalYearStartMonth": 0,
+          "graphTooltip": 1,
+          "id": null,
+          "links": [],
+          "liveNow": false,
+          "panels": [
+            {
+              "gridPos": { "h": 6, "w": 24, "x": 0, "y": 0 },
+              "id": 1,
+              "title": "RECOMMANDATIONS IA - Seuils et Alertes Intelligentes",
+              "type": "text",
+              "options": {
+                "mode": "markdown",
+                "content": "## Tableau des Seuils de Monitoring IA\n\n| Metrique | Normal (Vert) | Attention (Jaune) | Critique (Rouge) | Action Recommandee |\n|----------|---------------|--------------------|--------------------|---------------------|\n| **CPU** | < 60% | 60-80% | > 80% | Scale horizontalement si > 80% pendant 5min |\n| **Memoire** | < 70% | 70-85% | > 85% | Augmenter les limites ou ajouter des nodes |\n| **Disque** | < 70% | 70-85% | > 85% | Nettoyer les logs ou etendre le stockage |\n| **Z-Score Anomalie** | < 2 | 2-3 | > 3 | Investiguer immediatement si > 3 |\n| **Pod Restarts** | 0 | 1-3 | > 3 | Verifier les logs du pod et les ressources |\n| **HPA** | < max | = max (10min) | = max (30min) | Augmenter maxReplicas ou optimiser le code |\n\n### Legende des Predictions\n- **predict_linear** : Extrapolation lineaire basee sur les donnees recentes\n- **Z-Score** : Ecart par rapport a la moyenne (> 2 = anormal, > 3 = critique)\n- **Cluster Health** : Pourcentage de nodes UP par rapport au total"
+              },
+              "datasource": { "type": "prometheus", "uid": "prometheus" }
+            },
+            {
+              "gridPos": { "h": 5, "w": 8, "x": 0, "y": 6 },
+              "id": 2,
+              "title": "PREDICTION CPU +1h",
+              "type": "stat",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "targets": [
+                {
+                  "expr": "predict_linear(avg(1 - rate(node_cpu_seconds_total{mode=\"idle\"}[5m]))[30m:1m], 3600) * 100",
+                  "legendFormat": "CPU predit +1h",
+                  "refId": "A"
+                }
+              ],
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "percent",
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      { "color": "green", "value": null },
+                      { "color": "yellow", "value": 60 },
+                      { "color": "red", "value": 80 }
+                    ]
+                  },
+                  "min": 0,
+                  "max": 100
+                }
+              },
+              "options": {
+                "colorMode": "background",
+                "graphMode": "area",
+                "textMode": "auto",
+                "reduceOptions": { "calcs": ["lastNotNull"] }
+              }
+            },
+            {
+              "gridPos": { "h": 5, "w": 8, "x": 8, "y": 6 },
+              "id": 3,
+              "title": "PREDICTION DISQUE +24h",
+              "type": "stat",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "targets": [
+                {
+                  "expr": "predict_linear(avg(1 - node_filesystem_avail_bytes{mountpoint=\"/\"} / node_filesystem_size_bytes{mountpoint=\"/\"})[1h:5m], 86400) * 100",
+                  "legendFormat": "Disque predit +24h",
+                  "refId": "A"
+                }
+              ],
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "percent",
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      { "color": "green", "value": null },
+                      { "color": "yellow", "value": 70 },
+                      { "color": "red", "value": 85 }
+                    ]
+                  },
+                  "min": 0,
+                  "max": 100
+                }
+              },
+              "options": {
+                "colorMode": "background",
+                "graphMode": "area",
+                "textMode": "auto",
+                "reduceOptions": { "calcs": ["lastNotNull"] }
+              }
+            },
+            {
+              "gridPos": { "h": 5, "w": 8, "x": 16, "y": 6 },
+              "id": 4,
+              "title": "PREDICTION MEMOIRE +1h",
+              "type": "stat",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "targets": [
+                {
+                  "expr": "predict_linear(avg(1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)[30m:1m], 3600) * 100",
+                  "legendFormat": "Memoire predite +1h",
+                  "refId": "A"
+                }
+              ],
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "percent",
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      { "color": "green", "value": null },
+                      { "color": "yellow", "value": 70 },
+                      { "color": "red", "value": 85 }
+                    ]
+                  },
+                  "min": 0,
+                  "max": 100
+                }
+              },
+              "options": {
+                "colorMode": "background",
+                "graphMode": "area",
+                "textMode": "auto",
+                "reduceOptions": { "calcs": ["lastNotNull"] }
+              }
+            },
+            {
+              "gridPos": { "h": 5, "w": 8, "x": 0, "y": 11 },
+              "id": 5,
+              "title": "Cluster Health Score",
+              "type": "gauge",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "targets": [
+                {
+                  "expr": "sum(kube_node_status_condition{condition=\"Ready\",status=\"true\"}) / count(kube_node_info) * 100",
+                  "legendFormat": "Health %",
+                  "refId": "A"
+                }
+              ],
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "percent",
+                  "min": 0,
+                  "max": 100,
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      { "color": "red", "value": null },
+                      { "color": "yellow", "value": 50 },
+                      { "color": "green", "value": 80 }
+                    ]
+                  }
+                }
+              },
+              "options": {
+                "reduceOptions": { "calcs": ["lastNotNull"] },
+                "showThresholdLabels": false,
+                "showThresholdMarkers": true
+              }
+            },
+            {
+              "gridPos": { "h": 5, "w": 8, "x": 8, "y": 11 },
+              "id": 6,
+              "title": "Etat des Nodes UP/DOWN",
+              "type": "stat",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "targets": [
+                {
+                  "expr": "kube_node_status_condition{condition=\"Ready\",status=\"true\"} * on(node) group_left(nodename) kube_node_info",
+                  "legendFormat": "{{nodename}}",
+                  "refId": "A"
+                }
+              ],
+              "fieldConfig": {
+                "defaults": {
+                  "mappings": [
+                    { "type": "value", "options": { "1": { "text": "UP", "color": "green" } } },
+                    { "type": "value", "options": { "0": { "text": "DOWN", "color": "red" } } }
+                  ],
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      { "color": "red", "value": null },
+                      { "color": "green", "value": 1 }
+                    ]
+                  }
+                }
+              },
+              "options": {
+                "colorMode": "background",
+                "graphMode": "none",
+                "textMode": "auto",
+                "reduceOptions": { "calcs": ["lastNotNull"] }
+              }
+            },
+            {
+              "gridPos": { "h": 8, "w": 16, "x": 16, "y": 11 },
+              "id": 7,
+              "title": "CPU Actuel vs Predit +1h",
+              "type": "timeseries",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "targets": [
+                {
+                  "expr": "(1 - rate(node_cpu_seconds_total{mode=\"idle\"}[5m])) * on(instance) group_left(nodename) node_uname_info * 100",
+                  "legendFormat": "CPU actuel - {{nodename}}",
+                  "refId": "A"
+                },
+                {
+                  "expr": "predict_linear((1 - rate(node_cpu_seconds_total{mode=\"idle\"}[5m])) * on(instance) group_left(nodename) node_uname_info[30m:1m], 3600) * 100",
+                  "legendFormat": "CPU predit +1h - {{nodename}}",
+                  "refId": "B"
+                }
+              ],
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "percent",
+                  "min": 0,
+                  "max": 100,
+                  "custom": {
+                    "lineWidth": 2,
+                    "fillOpacity": 10,
+                    "spanNulls": true
+                  }
+                },
+                "overrides": [
+                  {
+                    "matcher": { "id": "byRegexp", "options": "predit" },
+                    "properties": [
+                      { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } },
+                      { "id": "custom.fillOpacity", "value": 0 }
+                    ]
+                  }
+                ]
+              },
+              "options": {
+                "tooltip": { "mode": "multi" },
+                "legend": { "displayMode": "table", "placement": "bottom" }
+              }
+            },
+            {
+              "gridPos": { "h": 8, "w": 12, "x": 0, "y": 19 },
+              "id": 8,
+              "title": "Detection Anomalies CPU Z-Score",
+              "type": "timeseries",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "targets": [
+                {
+                  "expr": "(\n  (1 - rate(node_cpu_seconds_total{mode=\"idle\"}[5m])) * on(instance) group_left(nodename) node_uname_info\n  - avg_over_time(((1 - rate(node_cpu_seconds_total{mode=\"idle\"}[5m])) * on(instance) group_left(nodename) node_uname_info)[1h:5m])\n) / stddev_over_time(((1 - rate(node_cpu_seconds_total{mode=\"idle\"}[5m])) * on(instance) group_left(nodename) node_uname_info)[1h:5m])",
+                  "legendFormat": "Z-Score CPU - {{nodename}}",
+                  "refId": "A"
+                }
+              ],
+              "fieldConfig": {
+                "defaults": {
+                  "custom": {
+                    "lineWidth": 2,
+                    "fillOpacity": 10,
+                    "spanNulls": true,
+                    "thresholdsStyle": { "mode": "line" }
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      { "color": "green", "value": null },
+                      { "color": "yellow", "value": 2 },
+                      { "color": "red", "value": 3 }
+                    ]
+                  }
+                }
+              },
+              "options": {
+                "tooltip": { "mode": "multi" },
+                "legend": { "displayMode": "table", "placement": "bottom" }
+              }
+            },
+            {
+              "gridPos": { "h": 8, "w": 12, "x": 12, "y": 19 },
+              "id": 9,
+              "title": "Detection Anomalies Memoire Z-Score",
+              "type": "timeseries",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "targets": [
+                {
+                  "expr": "(\n  (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * on(instance) group_left(nodename) node_uname_info\n  - avg_over_time(((1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * on(instance) group_left(nodename) node_uname_info)[1h:5m])\n) / stddev_over_time(((1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * on(instance) group_left(nodename) node_uname_info)[1h:5m])",
+                  "legendFormat": "Z-Score Memoire - {{nodename}}",
+                  "refId": "A"
+                }
+              ],
+              "fieldConfig": {
+                "defaults": {
+                  "custom": {
+                    "lineWidth": 2,
+                    "fillOpacity": 10,
+                    "spanNulls": true,
+                    "thresholdsStyle": { "mode": "line" }
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      { "color": "green", "value": null },
+                      { "color": "yellow", "value": 2 },
+                      { "color": "red", "value": 3 }
+                    ]
+                  }
+                }
+              },
+              "options": {
+                "tooltip": { "mode": "multi" },
+                "legend": { "displayMode": "table", "placement": "bottom" }
+              }
+            },
+            {
+              "gridPos": { "h": 8, "w": 12, "x": 0, "y": 27 },
+              "id": 10,
+              "title": "HPA Autoscaling Replicas",
+              "type": "timeseries",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "targets": [
+                {
+                  "expr": "kube_horizontalpodautoscaler_status_current_replicas",
+                  "legendFormat": "Current - {{horizontalpodautoscaler}}",
+                  "refId": "A"
+                },
+                {
+                  "expr": "kube_horizontalpodautoscaler_spec_max_replicas",
+                  "legendFormat": "Max - {{horizontalpodautoscaler}}",
+                  "refId": "B"
+                },
+                {
+                  "expr": "kube_horizontalpodautoscaler_spec_min_replicas",
+                  "legendFormat": "Min - {{horizontalpodautoscaler}}",
+                  "refId": "C"
+                }
+              ],
+              "fieldConfig": {
+                "defaults": {
+                  "custom": {
+                    "lineWidth": 2,
+                    "fillOpacity": 5,
+                    "spanNulls": true
+                  },
+                  "decimals": 0,
+                  "min": 0
+                },
+                "overrides": [
+                  {
+                    "matcher": { "id": "byRegexp", "options": "Current" },
+                    "properties": [
+                      { "id": "color", "value": { "mode": "fixed", "fixedColor": "blue" } }
+                    ]
+                  },
+                  {
+                    "matcher": { "id": "byRegexp", "options": "Max" },
+                    "properties": [
+                      { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } },
+                      { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } }
+                    ]
+                  },
+                  {
+                    "matcher": { "id": "byRegexp", "options": "Min" },
+                    "properties": [
+                      { "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } },
+                      { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } }
+                    ]
+                  }
+                ]
+              },
+              "options": {
+                "tooltip": { "mode": "multi" },
+                "legend": { "displayMode": "table", "placement": "bottom" }
+              }
+            },
+            {
+              "gridPos": { "h": 8, "w": 12, "x": 12, "y": 27 },
+              "id": 11,
+              "title": "Restarts Pods Crash Detection",
+              "type": "timeseries",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "targets": [
+                {
+                  "expr": "increase(kube_pod_container_status_restarts_total[15m])",
+                  "legendFormat": "{{pod}} - {{container}}",
+                  "refId": "A"
+                }
+              ],
+              "fieldConfig": {
+                "defaults": {
+                  "custom": {
+                    "lineWidth": 2,
+                    "fillOpacity": 15,
+                    "spanNulls": true,
+                    "thresholdsStyle": { "mode": "line" }
+                  },
+                  "decimals": 0,
+                  "min": 0,
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      { "color": "green", "value": null },
+                      { "color": "yellow", "value": 1 },
+                      { "color": "red", "value": 3 }
+                    ]
+                  }
+                }
+              },
+              "options": {
+                "tooltip": { "mode": "multi" },
+                "legend": { "displayMode": "table", "placement": "bottom" }
+              }
+            },
+            {
+              "gridPos": { "h": 8, "w": 24, "x": 0, "y": 35 },
+              "id": 12,
+              "title": "Alertes Actives",
+              "type": "table",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "targets": [
+                {
+                  "expr": "ALERTS{alertstate=\"firing\"}",
+                  "format": "table",
+                  "instant": true,
+                  "legendFormat": "",
+                  "refId": "A"
+                }
+              ],
+              "fieldConfig": {
+                "defaults": {},
+                "overrides": [
+                  {
+                    "matcher": { "id": "byName", "options": "Time" },
+                    "properties": [
+                      { "id": "custom.hidden", "value": true }
+                    ]
+                  },
+                  {
+                    "matcher": { "id": "byName", "options": "__name__" },
+                    "properties": [
+                      { "id": "custom.hidden", "value": true }
+                    ]
+                  },
+                  {
+                    "matcher": { "id": "byName", "options": "Value" },
+                    "properties": [
+                      { "id": "custom.hidden", "value": true }
+                    ]
+                  },
+                  {
+                    "matcher": { "id": "byName", "options": "severity" },
+                    "properties": [
+                      {
+                        "id": "custom.cellOptions",
+                        "value": {
+                          "type": "color-background"
+                        }
+                      },
+                      {
+                        "id": "mappings",
+                        "value": [
+                          { "type": "value", "options": { "critical": { "color": "red", "text": "CRITICAL" } } },
+                          { "type": "value", "options": { "warning": { "color": "yellow", "text": "WARNING" } } },
+                          { "type": "value", "options": { "info": { "color": "blue", "text": "INFO" } } }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              },
+              "options": {
+                "showHeader": true,
+                "sortBy": [
+                  { "displayName": "severity", "desc": true }
+                ]
+              },
+              "transformations": [
+                {
+                  "id": "organize",
+                  "options": {
+                    "excludeByName": {
+                      "Time": true,
+                      "__name__": true,
+                      "Value": true
+                    }
+                  }
+                }
+              ]
+            }
+          ],
+          "refresh": "30s",
+          "schemaVersion": 38,
+          "style": "dark",
+          "tags": ["ai", "monitoring", "prediction", "anomaly-detection"],
+          "templating": { "list": [] },
+          "time": { "from": "now-3h", "to": "now" },
+          "timepicker": {},
+          "timezone": "",
+          "title": "AI Monitoring - Predictions et Anomalies",
+          "uid": "ai-monitoring-dashboard",
+          "version": 1,
+          "weekStart": ""
+        }
+    DASH_EOF
+  become: yes
+  become_user: ubuntu
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  changed_when: false
+  ignore_errors: yes
+
+# ===================== FINAL SUMMARY =====================
+- name: Display monitoring stack summary
   debug:
-    msg:
-      - "========================================="
-      - "FULL DEPLOYMENT COMPLETE!"
-      - "========================================="
-      - "Kubernetes: Initialized with Calico CNI"
-      - "Monitoring: Prometheus + Grafana + AlertManager"
-      - "HPA: php-apache autoscaling demo active"
-      - "Nginx: Demo app on NodePort 30088"
-      - "AI Dashboard: Anomaly detection + predictions"
-      - "Custom Alerts: CPU, Memory, CrashLoop, HPA"
-      - "========================================="
+    msg: |
+      ============================================================
+      MONITORING STACK DEPLOYED SUCCESSFULLY
+      ============================================================
+      Grafana:      http://{{ controller_ip }}:30080  (admin / admin123)
+      Prometheus:   http://{{ controller_ip }}:30090
+      AlertManager: http://{{ controller_ip }}:30093
+      Nginx Demo:   http://{{ controller_ip }}:30088
+      ============================================================
+      Custom Alerts: HighCPUUsage, HighMemoryUsage, PodCrashLooping, HPAMaxedOut
+      Dashboard:     AI Monitoring - Predictions et Anomalies
+      HPA Demo:      php-apache (min=1, max=10, cpu=50%)
+      Metrics Server: v0.7.2 with --kubelet-insecure-tls
+      ============================================================
