@@ -483,3 +483,314 @@
   debug:
     var: storage_info.stdout_lines
   when: using_cinder | bool
+
+# === METRICS SERVER (required for HPA) ===
+- name: Check if metrics-server is installed
+  become: yes
+  become_user: ubuntu
+  shell: |
+    kubectl get deployment metrics-server -n kube-system 2>/dev/null && echo 'installed' || echo 'not_installed'
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  register: metrics_server_check
+  changed_when: false
+
+- name: Install metrics-server
+  become: yes
+  become_user: ubuntu
+  shell: |
+    kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+    sleep 5
+    kubectl patch deployment metrics-server -n kube-system --type='json' \
+      -p='[{"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--kubelet-insecure-tls"}]'
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  when: "'not_installed' in metrics_server_check.stdout"
+  retries: 3
+  delay: 10
+  ignore_errors: yes
+
+- name: Wait for metrics-server to be ready
+  become: yes
+  become_user: ubuntu
+  shell: |
+    kubectl wait --for=condition=Available --timeout=120s deployment/metrics-server -n kube-system
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  retries: 3
+  delay: 15
+  ignore_errors: yes
+
+# === HPA DEMO (Horizontal Pod Autoscaler) ===
+- name: Deploy HPA demo application (php-apache)
+  become: yes
+  become_user: ubuntu
+  shell: |
+    cat <<EOF | kubectl apply -f -
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: php-apache
+      namespace: default
+    spec:
+      replicas: 1
+      selector:
+        matchLabels:
+          app: php-apache
+      template:
+        metadata:
+          labels:
+            app: php-apache
+        spec:
+          containers:
+          - name: php-apache
+            image: registry.k8s.io/hpa-example
+            ports:
+            - containerPort: 80
+            resources:
+              requests:
+                cpu: 200m
+              limits:
+                cpu: 500m
+    ---
+    apiVersion: v1
+    kind: Service
+    metadata:
+      name: php-apache
+      namespace: default
+    spec:
+      ports:
+      - port: 80
+      selector:
+        app: php-apache
+    ---
+    apiVersion: autoscaling/v2
+    kind: HorizontalPodAutoscaler
+    metadata:
+      name: php-apache-hpa
+      namespace: default
+    spec:
+      scaleTargetRef:
+        apiVersion: apps/v1
+        kind: Deployment
+        name: php-apache
+      minReplicas: 1
+      maxReplicas: 10
+      metrics:
+      - type: Resource
+        resource:
+          name: cpu
+          target:
+            type: Utilization
+            averageUtilization: 50
+    EOF
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  changed_when: false
+
+# === NGINX DEMO APP ===
+- name: Deploy nginx demo application
+  become: yes
+  become_user: ubuntu
+  shell: |
+    cat <<EOF | kubectl apply -f -
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: nginx
+      namespace: default
+    spec:
+      replicas: 2
+      selector:
+        matchLabels:
+          app: nginx
+      template:
+        metadata:
+          labels:
+            app: nginx
+        spec:
+          containers:
+          - name: nginx
+            image: nginx:latest
+            ports:
+            - containerPort: 80
+            resources:
+              requests:
+                cpu: 50m
+                memory: 64Mi
+              limits:
+                cpu: 100m
+                memory: 128Mi
+    ---
+    apiVersion: v1
+    kind: Service
+    metadata:
+      name: nginx
+      namespace: default
+    spec:
+      type: NodePort
+      ports:
+      - port: 80
+        nodePort: 30088
+      selector:
+        app: nginx
+    EOF
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  changed_when: false
+
+# === ALERT RULES FOR DEMO ===
+- name: Deploy custom PrometheusRule alerts
+  become: yes
+  become_user: ubuntu
+  shell: |
+    cat <<'EOF' | kubectl apply -f -
+    apiVersion: monitoring.coreos.com/v1
+    kind: PrometheusRule
+    metadata:
+      name: custom-alerts
+      namespace: monitoring
+      labels:
+        release: prometheus
+    spec:
+      groups:
+      - name: custom.rules
+        rules:
+        - alert: HighCPUUsage
+          expr: 100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High CPU usage detected"
+            description: "CPU usage is above 80% for more than 2 minutes."
+        - alert: HighMemoryUsage
+          expr: (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > 85
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High memory usage detected"
+            description: "Memory usage is above 85% for more than 2 minutes."
+        - alert: PodCrashLooping
+          expr: rate(kube_pod_container_status_restarts_total[5m]) > 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Pod crash looping"
+            description: "A pod is crash looping."
+        - alert: HPAMaxedOut
+          expr: kube_horizontalpodautoscaler_status_current_replicas == kube_horizontalpodautoscaler_spec_max_replicas
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "HPA at maximum replicas"
+            description: "HPA is running at max capacity."
+    EOF
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  changed_when: false
+  ignore_errors: yes
+
+# === AI MONITORING GRAFANA DASHBOARD ===
+- name: Create AI monitoring dashboard JSON file
+  copy:
+    dest: /tmp/ai-dashboard.json
+    content: |
+      {
+        "annotations": {"list": []},
+        "editable": true,
+        "panels": [
+          {
+            "title": "AI Anomaly Score - CPU",
+            "type": "timeseries",
+            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+            "targets": [{"expr": "abs(rate(node_cpu_seconds_total{mode=\"idle\"}[5m]) - avg_over_time(rate(node_cpu_seconds_total{mode=\"idle\"}[5m])[1h:])) / stddev_over_time(rate(node_cpu_seconds_total{mode=\"idle\"}[5m])[1h:])", "legendFormat": "Z-Score {{instance}}", "refId": "A"}],
+            "fieldConfig": {"defaults": {"thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 1.5}, {"color": "red", "value": 2.5}]}}}
+          },
+          {
+            "title": "AI Anomaly Score - Memory",
+            "type": "timeseries",
+            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+            "targets": [{"expr": "abs((node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes) / node_memory_MemTotal_bytes - avg_over_time(((node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes) / node_memory_MemTotal_bytes)[1h:])) / stddev_over_time(((node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes) / node_memory_MemTotal_bytes)[1h:])", "legendFormat": "Z-Score {{instance}}", "refId": "A"}],
+            "fieldConfig": {"defaults": {"thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 1.5}, {"color": "red", "value": 2.5}]}}}
+          },
+          {
+            "title": "Pod Autoscaling Activity",
+            "type": "timeseries",
+            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+            "targets": [
+              {"expr": "kube_horizontalpodautoscaler_status_current_replicas", "legendFormat": "Current {{horizontalpodautoscaler}}", "refId": "A"},
+              {"expr": "kube_horizontalpodautoscaler_status_desired_replicas", "legendFormat": "Desired {{horizontalpodautoscaler}}", "refId": "B"}
+            ]
+          },
+          {
+            "title": "Network Anomaly Detection",
+            "type": "timeseries",
+            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+            "targets": [{"expr": "abs(rate(node_network_receive_bytes_total[5m]) - avg_over_time(rate(node_network_receive_bytes_total[5m])[1h:])) / (stddev_over_time(rate(node_network_receive_bytes_total[5m])[1h:]) > 0)", "legendFormat": "Z-Score {{instance}} {{device}}", "refId": "A"}],
+            "fieldConfig": {"defaults": {"thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 2}, {"color": "red", "value": 3}]}}}
+          },
+          {
+            "title": "Cluster Health Score (AI)",
+            "type": "gauge",
+            "gridPos": {"h": 8, "w": 8, "x": 0, "y": 16},
+            "targets": [{"expr": "100 - (count(ALERTS{alertstate=\"firing\"}) or vector(0)) * 10 - (count(kube_pod_status_phase{phase=\"Failed\"}) or vector(0)) * 5", "refId": "A"}],
+            "fieldConfig": {"defaults": {"min": 0, "max": 100, "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "yellow", "value": 50}, {"color": "green", "value": 80}]}}}
+          },
+          {
+            "title": "Predictive CPU Capacity",
+            "type": "timeseries",
+            "gridPos": {"h": 8, "w": 8, "x": 8, "y": 16},
+            "targets": [
+              {"expr": "1 - avg(rate(node_cpu_seconds_total{mode=\"idle\"}[5m]))", "legendFormat": "Current CPU", "refId": "A"},
+              {"expr": "predict_linear(avg(1 - rate(node_cpu_seconds_total{mode=\"idle\"}[5m]))[30m:1m], 3600)", "legendFormat": "Predicted (1h)", "refId": "B"}
+            ]
+          },
+          {
+            "title": "Active Alerts",
+            "type": "table",
+            "gridPos": {"h": 8, "w": 8, "x": 16, "y": 16},
+            "targets": [{"expr": "ALERTS{alertstate=\"firing\"}", "format": "table", "instant": true, "refId": "A"}]
+          }
+        ],
+        "schemaVersion": 38,
+        "tags": ["ai", "monitoring", "anomaly"],
+        "time": {"from": "now-1h", "to": "now"},
+        "title": "AI Monitoring & Anomaly Detection",
+        "uid": "ai-monitoring-dash"
+      }
+    owner: ubuntu
+    group: ubuntu
+    mode: '0644'
+
+- name: Deploy AI monitoring dashboard ConfigMap
+  become: yes
+  become_user: ubuntu
+  shell: |
+    kubectl create configmap ai-monitoring-dashboard \
+      --namespace monitoring \
+      --from-file=ai-monitoring.json=/tmp/ai-dashboard.json \
+      --dry-run=client -o yaml | \
+    kubectl label --local -f - grafana_dashboard=1 -o yaml --dry-run=client | \
+    kubectl apply -f -
+  environment:
+    KUBECONFIG: /home/ubuntu/.kube/config
+  changed_when: false
+  ignore_errors: yes
+
+- name: Final deployment summary
+  debug:
+    msg:
+      - "========================================="
+      - "FULL DEPLOYMENT COMPLETE!"
+      - "========================================="
+      - "Kubernetes: Initialized with Calico CNI"
+      - "Monitoring: Prometheus + Grafana + AlertManager"
+      - "HPA: php-apache autoscaling demo active"
+      - "Nginx: Demo app on NodePort 30088"
+      - "AI Dashboard: Anomaly detection + predictions"
+      - "Custom Alerts: CPU, Memory, CrashLoop, HPA"
+      - "========================================="

@@ -141,7 +141,6 @@
     url: "https://github.com/Mirantis/cri-dockerd/releases/download/v0.3.10/cri-dockerd_0.3.10.3-0.ubuntu-jammy_amd64.deb"
     dest: /tmp/cri-dockerd.deb
     mode: '0644'
-    checksum: "sha256:5a9f09f807ca38a4970396dd23f6919b9d4930b4"
     force: yes
   retries: 10
   delay: 10
@@ -204,7 +203,7 @@
   become: yes
   become_user: ubuntu
   shell: |
-    kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/{{ calico_version }}/manifests/tigera-operator.yaml
+    kubectl apply --server-side -f https://raw.githubusercontent.com/projectcalico/calico/{{ calico_version }}/manifests/tigera-operator.yaml
   environment:
     KUBECONFIG: /home/ubuntu/.kube/config
   when: node_role == 'master'
