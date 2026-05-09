@@ -215,7 +215,7 @@
     KUBECONFIG: /home/ubuntu/.kube/config
   register: nodes_ready
   until: nodes_ready.stdout | int >= 1
-  retries: 30
+  retries: 90
   delay: 15
   changed_when: false
   when: node_role | default('master') == "master"
