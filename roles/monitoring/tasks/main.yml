@@ -27,7 +27,7 @@
     KUBECONFIG: /home/ubuntu/.kube/config
   register: nodes_ready
   until: nodes_ready.stdout | int >= 1
-  retries: 30
+  retries: 60
   delay: 20
   changed_when: false
 
@@ -405,7 +405,7 @@
       --values /home/ubuntu/prometheus-values.yaml \
       --no-hooks \
       --wait \
-      --timeout 20m \
+      --timeout 30m \
       --version 65.1.0 2>&1
   become: yes
   become_user: ubuntu
@@ -433,7 +433,7 @@
     KUBECONFIG: /home/ubuntu/.kube/config
   register: operator_ready
   until: operator_ready.rc == 0
-  retries: 15
+  retries: 30
   delay: 20
   changed_when: false
   ignore_errors: yes
@@ -448,7 +448,7 @@
     KUBECONFIG: /home/ubuntu/.kube/config
   register: prometheus_pods
   until: prometheus_pods.stdout | int >= 1
-  retries: 30
+  retries: 60
   delay: 15
   changed_when: false
   ignore_errors: yes
@@ -463,7 +463,7 @@
     KUBECONFIG: /home/ubuntu/.kube/config
   register: grafana_ready
   until: grafana_ready.stdout == "True"
-  retries: 30
+  retries: 60
   delay: 15
   changed_when: false
   ignore_errors: yes
@@ -545,7 +545,7 @@
   environment:
     KUBECONFIG: /home/ubuntu/.kube/config
   changed_when: false
-  retries: 3
+  retries: 15
   delay: 15
   register: metrics_rollout
   until: metrics_rollout is succeeded

@@ -168,7 +168,7 @@
   environment:
     KUBECONFIG: /home/ubuntu/.kube/config
   when: node_role | default('master') == "master"
-  retries: 5
+  retries: 15
   delay: 15
   register: tigera_ready
   until: tigera_ready is succeeded
