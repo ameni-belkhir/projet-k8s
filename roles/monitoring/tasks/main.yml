@@ -40,7 +40,7 @@
     KUBECONFIG: /home/ubuntu/.kube/config
   register: coredns_ready
   until: coredns_ready.stdout | int >= 1
-  retries: 30
+  retries: 60
   delay: 10
   changed_when: false
 
